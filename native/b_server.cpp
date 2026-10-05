@@ -244,6 +244,11 @@ struct BServer {
     std::mutex playSwapMu;
     bool      bOutboundPlay       = false;
     bool      bInboundPlayPending = false;
+    // Set the moment we hand B a packet that changes its protocol, cleared
+    // when B confirms it made the change.  Until then B is in one state
+    // and we are still in the other, and forwarding across that gap is a
+    // protocol violation on B ("Packet received while unconfigured").
+    std::atomic<bool> bAwaitingConfigAck{false};
 
     // Runs protocol swaps on B's event loop, in order with writes queued there.
     jclass    loopTaskCls             = nullptr;
@@ -3061,6 +3066,10 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
             // moved to the PLAY protocol at this point in its own pipeline (see
             // ensureBPlayProtocol).  B is marked as being in PLAY so the next
             // packet takes the game branch, which performs the swap first.
+            // Mirror image of the StartConfiguration case: B has been told to go
+            // to PLAY but is still on CONFIGURATION until it processes this and
+            // answers.  Keep holding A's PLAY traffic until that answer lands.
+            g_bs.bAwaitingConfigAck.store(true, std::memory_order_release);
             g_bs.bState.store(BState::Play, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> l(g_bConnMu);
@@ -3075,6 +3084,18 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
 
     if (state != BState::Play) { env->DeleteLocalRef(ch); return; }
     if (cls.rfind(kGame, 0) != 0) { env->DeleteLocalRef(ch); return; }
+
+    // B has been told to change protocol but has not confirmed it yet.  It has
+    // already left PLAY on its side while we still hold PLAY here, so anything
+    // forwarded now arrives in the state it just left.
+    if (g_bs.bAwaitingConfigAck.load(std::memory_order_acquire)) {
+        static std::atomic<unsigned> held{0};
+        unsigned n = held.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 5 || (n & 0x3FF) == 0)
+            LogTo("config-switch: holding %s until B confirms (%u held)", cls.c_str(), n);
+        env->DeleteLocalRef(ch);
+        return;
+    }
 
     // Swap B onto the PLAY protocol before its first PLAY packet, using the
     // ProtocolInfos lifted from A's pipeline (correct registry access).
@@ -3098,7 +3119,9 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
     // change itself waits for B's acknowledgement (see BSide_OnPacket), because
     // that is the moment B actually leaves PLAY.
     if (g_bs.startConfigPacketCls && env->IsInstanceOf(packet, g_bs.startConfigPacketCls)) {
-        LogTo("reconfigure: A was told to re-enter CONFIGURATION (server transfer)");
+        g_bs.bAwaitingConfigAck.store(true, std::memory_order_release);
+        LogTo("reconfigure: A was told to re-enter CONFIGURATION (server transfer) — "
+              "holding PLAY traffic until B confirms");
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
 
@@ -3198,6 +3221,7 @@ void BSide_OnPacket(JNIEnv* env, jobject ctx, jobject msg) {
         }
         g_bs.playProtocolReady = false;
         g_bs.playSboundReady = false;
+        g_bs.bAwaitingConfigAck.store(false, std::memory_order_release);
         g_bs.bState.store(BState::AwaitConfiguration, std::memory_order_release);
         LogTo("reconfigure: B acknowledged; both directions back on CONFIGURATION, "
               "PLAY ProtocolInfo dropped for re-lift");
@@ -3214,6 +3238,7 @@ void BSide_OnPacket(JNIEnv* env, jobject ctx, jobject msg) {
         // B's decoder needs PLAY's serverbound ProtocolInfo, which is lifted
         // from A on A's first PLAY packet.  If that has not happened yet, leave
         // B's reads paused; the PLAY switch in BServer_ForwardToB finishes it.
+        g_bs.bAwaitingConfigAck.store(false, std::memory_order_release);
         {
             std::lock_guard<std::mutex> l(g_bs.playSwapMu);
             if (g_bs.playSboundReady) {
