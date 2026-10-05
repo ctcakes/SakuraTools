@@ -10,6 +10,8 @@
 #include <string.h>
 #include <wchar.h>
 
+#include "relay.h"
+
 BOOL DoInject(DWORD dwProcessId, const char* cpDllFile,
               char* outMessage, int maxLen);
 
@@ -190,7 +192,7 @@ static BOOL proxy_listener_ready(DWORD pid) {
         for (DWORD i = 0; i < table->dwNumEntries; ++i) {
             MIB_TCPROW_OWNER_PID* row = &table->table[i];
             if (row->dwOwningPid == pid &&
-                network_port_to_host(row->dwLocalPort) == 25565) {
+                network_port_to_host(row->dwLocalPort) == PROXY_UPSTREAM_PORT) {
                 ready = TRUE;
                 break;
             }
@@ -201,7 +203,8 @@ static BOOL proxy_listener_ready(DWORD pid) {
 }
 
 static BOOL wait_for_proxy_listener(DWORD pid) {
-    fprintf(stdout, "waiting for PID %lu to listen on 127.0.0.1:25565...\n", pid);
+    fprintf(stdout, "waiting for PID %lu to listen on 127.0.0.1:%u...\n",
+            pid, PROXY_UPSTREAM_PORT);
     fflush(stdout);
     for (int elapsed = 0; elapsed < 30000; elapsed += 50) {
         if (proxy_listener_ready(pid)) return TRUE;
@@ -223,10 +226,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // Elevate up front rather than waiting for the first ERROR_ACCESS_DENIED:
-    // the elevated instance then does the window-waiting too, so the user sees
-    // exactly one UAC prompt.  The child is already elevated, so it will not
-    // re-enter this branch.
+    // Elevate before binding: the elevated instance owns the relay port for its
+    // whole lifetime, so if we bound it here the re-launched child could not.
     if (!is_elevated()) {
         fprintf(stdout, "not running as administrator - requesting elevation (UAC)...\n");
         fflush(stdout);
@@ -238,6 +239,18 @@ int main(int argc, char** argv) {
                         "with access denied).\n");
     }
 
+    // Take the port B connects to *now*, before Minecraft is even up.  The
+    // launcher drops A straight into a server, so B has no window to connect
+    // during; accepting it here and forwarding later is what makes the ordering
+    // deterministic.
+    if (!relay_start(RELAY_LISTEN_PORT, PROXY_UPSTREAM_PORT)) {
+        return 3;
+    }
+    fprintf(stdout,
+            "listening on 0.0.0.0:%u - connect the second client now if you like;\n"
+            "it will wait until the in-game proxy is ready.\n", RELAY_LISTEN_PORT);
+    fflush(stdout);
+
     pid = wait_for_mc_process();
     fprintf(stdout, "matched Java window (title contains \"%ls\"), PID %lu\n",
             g_title_needle[0] ? g_title_needle : L"*", pid);
@@ -246,10 +259,13 @@ int main(int argc, char** argv) {
     BOOL ok = DoInject((DWORD)pid, dll, msg, (int)sizeof(msg));
     fprintf(stdout, "%s\n", msg);
     if (!ok) return 1;
+    // The relay already holds 25565; what we wait for now is the in-game proxy
+    // on its own loopback port, which is what unblocks any client already
+    // waiting in the relay.
     if (!wait_for_proxy_listener((DWORD)pid)) {
-        fprintf(stderr, "injection completed, but the proxy listener was not ready after 30 seconds\n");
+        fprintf(stderr, "injection completed, but the in-game proxy was not ready after 30 seconds\n");
         return 4;
     }
-    fprintf(stdout, "proxy listener ready\n");
+    fprintf(stdout, "in-game proxy ready - relay is forwarding\n");
     return 0;
 }

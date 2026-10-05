@@ -49,6 +49,7 @@ set_target_properties(MinecraftProxy_msvc PROPERTIES
 
 add_executable(reflective_injector
     injector/cli.c
+    injector/relay.c
     injector/Inject.c
     injector/LoadLibraryR.c
     injector/GetProcAddressR.c
@@ -63,6 +64,8 @@ target_compile_definitions(reflective_injector PRIVATE
 target_link_libraries(reflective_injector PRIVATE
     advapi32
     iphlpapi
+    shell32
+    ws2_32
     kernel32
     user32
 )

@@ -47,8 +47,10 @@ if errorlevel 1 ( echo [!] proxy build failed & popd & exit /b 1 )
 echo === reflective_injector.exe ===
 cl %CFLAGS% /DWIN32_LEAN_AND_MEAN %DEFS% /I injector ^
    /Fobuild\inj_\ /Fd:build\injector.pdb ^
-   injector\cli.c injector\Inject.c injector\LoadLibraryR.c injector\GetProcAddressR.c ^
-   /link /OUT:build\reflective_injector.exe advapi32.lib iphlpapi.lib shell32.lib kernel32.lib user32.lib
+   injector\cli.c injector\relay.c injector\Inject.c ^
+   injector\LoadLibraryR.c injector\GetProcAddressR.c ^
+   /link /OUT:build\reflective_injector.exe ^
+   advapi32.lib iphlpapi.lib shell32.lib ws2_32.lib kernel32.lib user32.lib
 if errorlevel 1 ( echo [!] injector build failed & popd & exit /b 1 )
 
 echo === starain_inject.dll ===

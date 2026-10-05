@@ -1692,10 +1692,16 @@ bool bindServer(JNIEnv* env, jobject mcLoader) {
         init);
     env->DeleteLocalRef(init);
 
-    jstring host = env->NewStringUTF("0.0.0.0");
+    // Loopback only, and on a different port from the one players connect to:
+    // reflective_injector.exe owns 0.0.0.0:25565 from before the game starts and
+    // TCP-bridges every client it accepts to us here.  That is what lets B
+    // connect while A is still booting, instead of racing A's configuration
+    // phase.  Running without the injector (starain_inject.dll, inject.ps1)
+    // means pointing B straight at 25566.
+    jstring host = env->NewStringUTF("127.0.0.1");
     jobject isa  = env->NewObject(isaCls,
         env->GetMethodID(isaCls, "<init>", "(Ljava/lang/String;I)V"),
-        host, (jint)25565);
+        host, (jint)25566);
     env->DeleteLocalRef(host);
 
     jobject future = env->CallObjectMethod(sb,
@@ -1713,7 +1719,7 @@ bool bindServer(JNIEnv* env, jobject mcLoader) {
     }
     env->DeleteLocalRef(sb);
     env->DeleteLocalRef(elg);
-    LogTo("BServer: bound 0.0.0.0:25565 (all interfaces, LAN-wide)");
+    LogTo("BServer: bound 127.0.0.1:25566 (loopback; injector bridges 25565 -> here)");
     return true;
 }
 

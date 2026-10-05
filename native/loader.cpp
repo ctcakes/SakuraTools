@@ -225,7 +225,7 @@ static DWORD WINAPI ProxyInitWorker(LPVOID) {
         LogTo("ProxyInitWorker: InstallBServer FAILED (B-side proxy unavailable)");
 
     } else {
-        LogTo("ProxyInitWorker: InstallBServer OK — listening on 127.0.0.1:25565");
+        LogTo("ProxyInitWorker: InstallBServer OK — listening on 127.0.0.1:25566");
 
         // The 1.20.1 build blocked A's Render thread until B had reached PLAY.
         // That cannot work from 1.20.2 onwards: B's CONFIGURATION phase is

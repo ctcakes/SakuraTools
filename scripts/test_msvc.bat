@@ -30,6 +30,17 @@ build\test\edit_self_test.exe
 if errorlevel 1 ( echo [!] edit_self_test FAILED & popd & exit /b 1 )
 
 echo.
+echo ==[ relay_self_test ]==
+REM Verifies the injector's TCP bridge, in particular that a client which
+REM connects before the in-game proxy exists is held and then forwarded.
+cl %CFLAGS% /Fobuild\test\ ^
+   tests\relay_self_test.c injector\relay.c ^
+   /link /OUT:build\test\relay_self_test.exe ws2_32.lib
+if errorlevel 1 ( echo [!] build failed & popd & exit /b 1 )
+build\test\relay_self_test.exe
+if errorlevel 1 ( echo [!] relay_self_test FAILED & popd & exit /b 1 )
+
+echo.
 echo ==[ javac fixtures ]==
 javac -d "%BUILD%" tests\java\Connection.java tests\java\ChannelDuplexHandler.java ^
       tests\java\GameContextContract.java tests\java\Verify.java

@@ -7,7 +7,11 @@ $Dll       = Join-Path $Here 'MinecraftProxy_msvc.dll'
 $Injector  = Join-Path $Here 'reflective_injector.exe'
 $InjectPs1 = Join-Path $Here 'inject.ps1'
 $LogPath   = Join-Path $env:TEMP 'MinecraftProxy.log'
+# Port the second client connects to.  reflective_injector owns it from
+# process start and bridges to the in-game proxy on 25566, so B can connect
+# while Minecraft is still booting.
 $ProxyPort = 25565
+$ProxyUpstreamPort = 25566
 # Substring of the Minecraft window title.  Every launcher titles the window
 # differently, so this is overridable: set MC_WINDOW_TITLE before running.
 $TitleMatch = if ($env:MC_WINDOW_TITLE) { $env:MC_WINDOW_TITLE } else { 'KKCraft' }
@@ -121,9 +125,11 @@ function Show-Status {
     if ($listener) {
         $owner = try { (Get-Process -Id $listener.OwningProcess -ErrorAction Stop).ProcessName } catch { '?' }
         $color = if ($mc -and $listener.OwningProcess -eq $mc.Id) { 'Green' } else { 'Yellow' }
-        Write-Kv "Proxy port ${ProxyPort}" ("bound by PID {0} ({1})" -f $listener.OwningProcess, $owner) $color
+        Write-Kv "Relay port ${ProxyPort}" ("bound by PID {0} ({1})" -f $listener.OwningProcess, $owner) $color
     } else {
-        Write-Kv "Proxy port ${ProxyPort}" 'NOT bound (proxy not injected yet)' DarkYellow
+        Write-Kv "Relay port ${ProxyPort}" 'NOT bound (injector not running)' DarkYellow
+    $up = Get-NetTCPConnection -LocalPort $ProxyUpstreamPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($up) { Write-Kv "In-game proxy ${ProxyUpstreamPort}" 'listening' Green }
     }
     $b = Get-BClient
     if ($b) {
@@ -166,7 +172,7 @@ function Do-Inject {
     }
     $listener = Get-ProxyListener
     if ($listener) {
-        Write-Host ("Proxy port ${ProxyPort} is already bound by PID {0}. Injection skipped." -f $listener.OwningProcess) -ForegroundColor Yellow
+        Write-Host ("Relay port ${ProxyPort} is already bound by PID {0} - the injector is probably already running. Injection skipped." -f $listener.OwningProcess) -ForegroundColor Yellow
         return
     }
     if (Test-Path $Injector) {

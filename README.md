@@ -7,7 +7,18 @@
 1. 用 JVMTI 的 `ClassFileLoadHook` 改写 `net.minecraft.network.Connection.channelActive`，
    在方法入口插入一次 native 调用，拿到 A 的连接和 netty pipeline。
 2. 往 A 的 pipeline 里插一个匿名 netty handler 做中继，拦下 A 收到的每个包。
-3. 在 `0.0.0.0:25565` 起一个假服务器：B 客户端连上来登录，然后 A 的整个世界流被转发给 B。
+3. 在 `127.0.0.1:25566` 起一个假服务器：B 客户端连上来登录，然后 A 的整个世界流被转发给 B。
+
+端口有两个，分工是刻意的：
+
+| 端口 | 谁在监听 | 作用 |
+|---|---|---|
+| `25565` | **注入器进程** | B 连这个。注入器一开始就占住它，B 想什么时候连都行 |
+| `25566` | 游戏内的 DLL | 真正的假服务器，只监听回环，由注入器把 B 桥过来 |
+
+为什么要拆开：启动器是用启动参数把 A **直接丢进服务器**的，A 不经主菜单。
+如果端口要等 A 注入后才开，B 就得跟 A 的配置阶段抢时间；拆开之后 B 可以先连上
+在 `25565` 等着，等 DLL 起来再桥过去，没有竞态。
 
 **当前目标版本：Minecraft Java 1.21.8 + NeoForge 21.8.52（Java 21）。**
 1.20.1 的代码在 `main` 分支，这里是 `neoforge-1.21.8` 分支。
@@ -67,25 +78,34 @@ scripts\test_msvc.bat
 
 ## 注入
 
-1. 启动 1.21.8 NeoForge 客户端。
-2. 注入：
+**先跑注入器，再启动 A。** 注入器会立刻占住 25565，然后等游戏窗口出现再注入。
+因为 A 是启动器直接丢进服务器的，注入必须赶在它连服务器之前完成。
 
-   ```powershell
-   # 推荐：交互式菜单
-   powershell -ExecutionPolicy Bypass -File proxy\launcher.ps1
+```powershell
+# 推荐：交互式菜单
+powershell -ExecutionPolicy Bypass -File proxy\launcher.ps1
 
-   # 或非交互
-   powershell -ExecutionPolicy Bypass -File scripts\auto_inject.ps1 `
-       -Dll <路径>\MinecraftProxy_msvc.dll `
-       -Injector <路径>\reflective_injector.exe
+# 或非交互
+powershell -ExecutionPolicy Bypass -File scripts\auto_inject.ps1 `
+    -Dll <路径>\MinecraftProxy_msvc.dll `
+    -Injector <路径>\reflective_injector.exe
 
-   # 或直接指定进程
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\inject.ps1 `
-       -ProcId <pid> -Dll <绝对路径>\MinecraftProxy_msvc.dll
-   ```
+# 或直接指定进程（注入器已运行时用）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\inject.ps1 `
+    -ProcId <pid> -Dll <绝对路径>\MinecraftProxy_msvc.dll
+```
 
-3. 用 B 客户端连 `127.0.0.1:25565`（或本机局域网 IP）。
-4. **B 连上之后再让 A 连服务器**——顺序不能反，原因见下。
+顺序：
+
+1. 跑注入器（默认匹配窗口标题含 `KKCraft`，可用第二个参数改，传 `""` 匹配任意 Java 窗口）。
+   会弹一次 UAC——游戏通常是提权启动的，不提权就 `OpenProcess` 失败（Error=5）。
+2. 看到 `listening on 0.0.0.0:25565` 后，**B 就连 `127.0.0.1:25565`**。
+   这时 A 还没起来也没关系，B 会停在「正在连接」等着。
+3. **启动 A**。注入器检测到窗口 → 注入 → DLL 在 25566 起来 → 注入器把 B 桥过去。
+4. A 自动进服，配置阶段流镜像给 B，B 进世界。
+
+不用 `reflective_injector.exe` 时（`starain_inject.dll`、`inject.ps1` 这类进程内注入），
+没有桥，B 要直接连 `127.0.0.1:25566`。
 
 ## 日志
 
@@ -98,7 +118,9 @@ scripts\test_msvc.bat
 | `cacheJavaRefs:` | 后面一串指针，**任何一个 null 都说明对应功能没了** |
 | `proto refs:` | `enc` / `dec` / `replace` / `playCB` / `playSB` 是否为 null |
 | `RetransformIfLoaded:` | `found 1 Connection, retransformed 1` 才算类改写成功 |
-| `BServer: bound` | 25565 起来了 |
+| `BServer: bound 127.0.0.1:25566` | 游戏内的假服务器起来了 |
+| `retransformed 1` | `Connection` 的字节码改写成功 |
+| `keepalive: nudged B` | B 在配置阶段等待中，保活生效 |
 | `login: B authenticated` | B 登录成功，进入配置阶段 |
 | `config-mirror:` | 把 A 的配置阶段包镜像给 B，最后一条会带 `ends configuration` |
 | `config-mirror: B is in PLAY` | B 真正进世界了 |
