@@ -24,6 +24,8 @@ constexpr const char* kInitChannelDesc     = "(Lio/netty/channel/Channel;)V";
 constexpr const char* kChannelReadDesc     = "(Lio/netty/channel/ChannelHandlerContext;Ljava/lang/Object;)V";
 constexpr const char* kChannelActiveDesc   = "(Lio/netty/channel/ChannelHandlerContext;)V";
 constexpr const char* kChannelInactiveDesc = "(Lio/netty/channel/ChannelHandlerContext;)V";
+constexpr const char* kExceptionCaughtDesc =
+    "(Lio/netty/channel/ChannelHandlerContext;Ljava/lang/Throwable;)V";
 
 // 1.20.2 inserted CONFIGURATION between LOGIN and PLAY; B parks in
 // AwaitConfiguration until A's own configuration stream has been mirrored over.
@@ -96,7 +98,9 @@ struct BServer {
     jclass    packetDecoderCls        = nullptr;
     jmethodID packetDecoderCtor       = nullptr;
 
+    jmethodID configIsAutoReadMid     = nullptr;
     jclass    protocolInfoCls         = nullptr;
+    jmethodID protocolInfoFlowMid     = nullptr;
     jmethodID simpleUnboundBindMid    = nullptr;
     jmethodID unboundBindMid          = nullptr;
     jmethodID rfbDecoratorMid         = nullptr;
@@ -791,6 +795,24 @@ jobject liftAProtocolInfo(JNIEnv* env, jobject aCtx, const char* name, bool requ
     env->DeleteLocalRef(hc);
     env->DeleteLocalRef(h);
 
+    // Which handler A actually handed over, and which direction it carries.
+    // The two names are not symmetric: a client's real handler is "encoder"
+    // while its decoder side is vanilla's "inbound_config" placeholder, so a
+    // lookup that silently misses is easy to mistake for a wrong direction.
+    {
+        const char* flow = "?";
+        if (pi && g_bs.protocolInfoFlowMid) {
+            jobject f = env->CallObjectMethod(pi, g_bs.protocolInfoFlowMid);
+            if (f && !env->ExceptionCheck()) {
+                flow = env->IsSameObject(f, g_bs.flowServerbound) ? "SERVERBOUND" : "CLIENTBOUND";
+                env->DeleteLocalRef(f);
+            }
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        LogTo("lift: A's \"%s\" -> %s (%s)", name,
+              pi ? "found" : "MISSING", pi ? flow : "-");
+    }
+
     if (pi && requirePlay && g_bs.protocolInfoIdMid && g_bs.connectionProtocolPlay) {
         jobject id = env->CallObjectMethod(pi, g_bs.protocolInfoIdMid);
         if (env->ExceptionCheck()) { env->ExceptionClear(); id = nullptr; }
@@ -879,6 +901,33 @@ void setProtocolDirections(JNIEnv* env, jobject channel, ProtoState st,
     }
 
     logPipeline(env, pipeline, "after swap");
+
+    // Two things decide whether B can still be heard: whether the channel is
+    // reading at all (vanilla parks reads when it swaps a decoder), and whether
+    // the two ProtocolInfos really are the directions B needs.  Getting either
+    // wrong is silent from the outside -- B just never speaks.
+    {
+        bool autoRead = false;
+        if (g_bs.channelConfigMid && g_bs.configIsAutoReadMid) {
+            jobject cfg = env->CallObjectMethod(channel, g_bs.channelConfigMid);
+            if (cfg && !env->ExceptionCheck()) {
+                autoRead = env->CallBooleanMethod(cfg, g_bs.configIsAutoReadMid) == JNI_TRUE;
+                env->DeleteLocalRef(cfg);
+            }
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        auto flowName = [&](jobject pi) -> const char* {
+            if (!pi || !g_bs.protocolInfoFlowMid) return "(none)";
+            jobject f = env->CallObjectMethod(pi, g_bs.protocolInfoFlowMid);
+            if (env->ExceptionCheck() || !f) { if (env->ExceptionCheck()) env->ExceptionClear(); return "(?)"; }
+            bool sb = env->IsSameObject(f, g_bs.flowServerbound);
+            env->DeleteLocalRef(f);
+            return sb ? "SERVERBOUND" : "CLIENTBOUND";
+        };
+        LogTo("proto-state: autoRead=%d  encoderPI=%s  decoderPI=%s",
+              autoRead ? 1 : 0,
+              flowName(g_bs.piPlayCbound), flowName(g_bs.piPlaySbound));
+    }
     env->DeleteLocalRef(pipeline);
 }
 
@@ -1141,6 +1190,19 @@ void JNICALL Native_BSide_channelRead(JNIEnv* env, jobject , jobject ctx, jobjec
     ::BSide_OnPacket(env, ctx, msg);
 }
 
+void JNICALL Native_BSide_exceptionCaught(JNIEnv* env, jobject , jobject, jobject cause) {
+    if (!cause) return;
+    jclass tc = env->FindClass("java/lang/Throwable");
+    jmethodID toStr = tc ? env->GetMethodID(tc, "toString", "()Ljava/lang/String;") : nullptr;
+    jstring s = toStr ? (jstring)env->CallObjectMethod(cause, toStr) : nullptr;
+    const char* c = (s && !env->ExceptionCheck()) ? env->GetStringUTFChars(s, nullptr) : nullptr;
+    LogTo("BServer: EXCEPTION on B channel: %s", c ? c : "<unprintable>");
+    if (c) env->ReleaseStringUTFChars(s, c);
+    if (s) env->DeleteLocalRef(s);
+    if (tc) env->DeleteLocalRef(tc);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
 bool defineInitClass(JNIEnv* env, jobject mcLoader) {
     std::string simple   = GenerateRandomClassName(2, 3);
     std::string internal = MakeInternalName(GetTrampolinePackage(), simple);
@@ -1185,6 +1247,10 @@ bool defineHandlerClass(JNIEnv* env, jobject mcLoader) {
     cb.addNativeMethod("channelActive",   kChannelActiveDesc,   ACC_PUBLIC | ACC_NATIVE);
     cb.addNativeMethod("channelInactive", kChannelInactiveDesc, ACC_PUBLIC | ACC_NATIVE);
     cb.addNativeMethod("channelRead",     kChannelReadDesc,     ACC_PUBLIC | ACC_NATIVE);
+    // A decode failure upstream lands here.  Without this override netty hands
+    // the throwable to slf4j -- the *game's* log -- and the proxy log shows
+    // nothing at all, which is indistinguishable from B simply not sending.
+    cb.addNativeMethod("exceptionCaught", kExceptionCaughtDesc, ACC_PUBLIC | ACC_NATIVE);
     std::vector<u1> bytes = cb.build();
 
     jclass defined = env->DefineClass(internal.c_str(), mcLoader,
@@ -1198,8 +1264,10 @@ bool defineHandlerClass(JNIEnv* env, jobject mcLoader) {
          reinterpret_cast<void*>(&Native_BSide_channelInactive)},
         {const_cast<char*>("channelRead"),     const_cast<char*>(kChannelReadDesc),
          reinterpret_cast<void*>(&Native_BSide_channelRead)},
+        {const_cast<char*>("exceptionCaught"), const_cast<char*>(kExceptionCaughtDesc),
+         reinterpret_cast<void*>(&Native_BSide_exceptionCaught)},
     };
-    if (env->RegisterNatives(defined, nats, 3) != 0) {
+    if (env->RegisterNatives(defined, nats, 4) != 0) {
         LogAndClearException(env, "BServer/RegisterHandler"); env->DeleteLocalRef(defined); return false;
     }
     g_bs.handlerCtor = env->GetMethodID(defined, "<init>", "()V");
@@ -1417,6 +1485,7 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
             "(Lio/netty/channel/ChannelOption;Ljava/lang/Object;)Z");
         g_bs.configSetAutoReadMid = env->GetMethodID(cfgCls, "setAutoRead",
             "(Z)Lio/netty/channel/ChannelConfig;");
+        g_bs.configIsAutoReadMid = env->GetMethodID(cfgCls, "isAutoRead", "()Z");
         if (env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(cfgCls);
     }
@@ -1494,6 +1563,9 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
 
     g_bs.protocolInfoCls = static_cast<jclass>(loadOrFind(env, mcLoader,
         "net.minecraft.network.ProtocolInfo", "Lnet/minecraft/network/ProtocolInfo;"));
+    if (g_bs.protocolInfoCls)
+        g_bs.protocolInfoFlowMid = env->GetMethodID(g_bs.protocolInfoCls, "flow",
+            "()Lnet/minecraft/network/protocol/PacketFlow;");
     if (g_bs.protocolInfoCls) {
         g_bs.protocolInfoIdMid = findMethodByDesc(g_bs.protocolInfoCls,
             "()Lnet/minecraft/network/ConnectionProtocol;", false);
