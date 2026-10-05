@@ -71,6 +71,7 @@ struct BServer {
     jmethodID statusPlayersCtor        = nullptr;
     jclass    componentCls             = nullptr;
     jmethodID componentLiteralMid      = nullptr;
+    jmethodID componentTranslatableMid = nullptr;
     jmethodID optionalOfMid            = nullptr;
     jmethodID listOfMid                = nullptr;
     jclass    pongResponsePacketCls     = nullptr;
@@ -208,6 +209,8 @@ struct BServer {
     jmethodID uuidGetLsbMid           = nullptr;
 
     jclass    loginFinishedPacketCls  = nullptr;
+    jclass    loginDisconnectCls      = nullptr;
+    jmethodID loginDisconnectCtor     = nullptr;
     jmethodID loginFinishedPacketCtor = nullptr;
 
     jclass    helloPacketCls          = nullptr;
@@ -255,10 +258,22 @@ struct BServer {
     bool      bOutboundPlay       = false;
     bool      bInboundPlayPending = false;
     // Set the moment we hand B a packet that changes its protocol, cleared
-    // when B confirms it made the change.  Until then B is in one state
-    // and we are still in the other, and forwarding across that gap is a
-    // protocol violation on B ("Packet received while unconfigured").
+    // when B confirms it made the change.  Until then B is in one state and we
+    // are still in the other, so forwarding across that gap is a protocol
+    // violation on B ("Packet received while unconfigured").
+    //
+    // Held packets are *queued*, not dropped.  Dropping was the first attempt
+    // and it killed the join: the first packet after the configuration phase is
+    // ClientboundLoginPacket, which is exactly what the client needs to build
+    // its world, and swallowing it leaves B on "Network Protocol Error".
     std::atomic<bool> bAwaitingConfigAck{false};
+    std::mutex         holdMu;
+    std::vector<jobject> heldPackets;
+
+    // Escape hatch: accept clients that announce a different protocol version.
+    // Useful while probing what a given client can survive; off by default
+    // because accepting them is what makes Via never translate.
+    bool      bAllowForeignVersion = true;
 
     // Runs protocol swaps on B's event loop, in order with writes queued there.
     jclass    loopTaskCls             = nullptr;
@@ -1858,6 +1873,17 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     if (env->ExceptionCheck()) env->ExceptionClear();
 
     // 1.20.2 renamed ClientboundGameProfilePacket -> ClientboundLoginFinishedPacket
+    jclass ldCls = loadOrFind(env, mcLoader,
+        "net.minecraft.network.protocol.login.ClientboundLoginDisconnectPacket",
+        "Lnet/minecraft/network/protocol/login/ClientboundLoginDisconnectPacket;");
+    if (ldCls) {
+        g_bs.loginDisconnectCls = static_cast<jclass>(env->NewGlobalRef(ldCls));
+        g_bs.loginDisconnectCtor = env->GetMethodID(ldCls, "<init>",
+            "(Lnet/minecraft/network/chat/Component;)V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(ldCls);
+    }
+
     jclass lfp = loadOrFind(env, mcLoader,
         "net.minecraft.network.protocol.login.ClientboundLoginFinishedPacket",
         "Lnet/minecraft/network/protocol/login/ClientboundLoginFinishedPacket;");
@@ -2000,6 +2026,10 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     if (compCls) {
         g_bs.componentCls = static_cast<jclass>(env->NewGlobalRef(compCls));
         g_bs.componentLiteralMid = env->GetStaticMethodID(compCls, "literal",
+            "(Ljava/lang/String;)Lnet/minecraft/network/chat/MutableComponent;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(compCls);
+        g_bs.componentTranslatableMid = env->GetStaticMethodID(compCls, "translatable",
             "(Ljava/lang/String;)Lnet/minecraft/network/chat/MutableComponent;");
         if (env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(compCls);
@@ -2420,6 +2450,25 @@ void writeToChan(JNIEnv* env, jobject ch, jobject packet) {
     if (!ch || !packet || !g_bs.channelWriteAndFlushMid) return;
     env->CallObjectMethod(ch, g_bs.channelWriteAndFlushMid, packet);
     if (env->ExceptionCheck()) LogAndClearException(env, "writeAndFlush");
+}
+
+// Release everything queued while B was changing protocol, in arrival order.
+// Called the moment B's acknowledgement lands, which is when it has actually
+// finished the switch.
+void flushHeldPackets(JNIEnv* env, jobject ch) {
+    std::vector<jobject> pending;
+    {
+        std::lock_guard<std::mutex> l(g_bs.holdMu);
+        pending.swap(g_bs.heldPackets);
+    }
+    if (pending.empty()) return;
+    LogTo("config-switch: B confirmed - releasing %zu queued packet(s)", pending.size());
+    for (jobject p : pending) {
+        if (p) {
+            writeToChan(env, ch, p);
+            env->DeleteGlobalRef(p);
+        }
+    }
 }
 
 // The current B session, for callers with no packet to key off: the config-phase
@@ -3157,10 +3206,20 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
     // already left PLAY on its side while we still hold PLAY here, so anything
     // forwarded now arrives in the state it just left.
     if (g_bs.bAwaitingConfigAck.load(std::memory_order_acquire)) {
-        static std::atomic<unsigned> held{0};
-        unsigned n = held.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (n <= 5 || (n & 0x3FF) == 0)
-            LogTo("config-switch: holding %s until B confirms (%u held)", cls.c_str(), n);
+        static constexpr size_t kMaxHeld = 4096;
+        std::lock_guard<std::mutex> l(g_bs.holdMu);
+        if (g_bs.heldPackets.size() < kMaxHeld) {
+            g_bs.heldPackets.push_back(env->NewGlobalRef(packet));
+            size_t n = g_bs.heldPackets.size();
+            if (n <= 5 || (n & 0x3FF) == 0)
+                LogTo("config-switch: queued %s until B confirms (%zu queued)",
+                      cls.c_str(), n);
+        } else {
+            static std::atomic<unsigned> over{0};
+            if (over.fetch_add(1, std::memory_order_relaxed) == 0)
+                LogTo("config-switch: hold queue full (%zu), dropping %s",
+                      kMaxHeld, cls.c_str());
+        }
         env->DeleteLocalRef(ch);
         return;
     }
@@ -3181,6 +3240,14 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
         }
         if (outbound || inbound)
             postProtocolSwap(env, ch, ProtoState::Play, outbound, inbound);
+    }
+
+    // Release anything queued while B was mid-switch.  This has to happen after
+    // postProtocolSwap above, never before: those are PLAY packets and the
+    // encoder must already be on PLAY or they go out under the old protocol.
+    if (!g_bs.bAwaitingConfigAck.load(std::memory_order_acquire) &&
+        g_bs.bOutboundPlay) {
+        flushHeldPackets(env, ch);
     }
 
     // Log the opening move of a server transfer / reconfiguration.  The state
@@ -3340,6 +3407,48 @@ void BSide_OnPacket(JNIEnv* env, jobject ctx, jobject msg) {
         LogTo("BServer: handshake protocol version = %d (we speak 772 = 1.21.8)%s",
               (int)announced, announced == 772 ? "  MATCH" : "  MISMATCH");
 
+        // Refuse a client that speaks a different protocol, the way a real
+        // server does.  This matters beyond politeness: client-side Via
+        // (ViaFabric / ViaFabricPlus) decides whether to translate by
+        // discovering the server's version, and a server that accepts anything
+        // gives it nothing to discover -- so it keeps sending packets in the
+        // client's own protocol, which is what produced every
+        // "Failed to decode packet ..." and "网络协议错误" seen so far.
+        //
+        // A STATUS ping is exempt: that is how the client is meant to learn our
+        // version in the first place.
+        if (!wantStatus && !g_bs.bAllowForeignVersion &&
+            announced != 772 && announced > 0 && selfCh &&
+            g_bs.loginDisconnectCls && g_bs.loginDisconnectCtor &&
+            g_bs.componentCls && g_bs.componentTranslatableMid) {
+            jstring key = env->NewStringUTF("multiplayer.disconnect.outdated_client");
+            jobject reason = env->CallStaticObjectMethod(g_bs.componentCls,
+                                                        g_bs.componentTranslatableMid, key);
+            env->DeleteLocalRef(key);
+            if (reason && !env->ExceptionCheck()) {
+                jobject pkt = env->NewObject(g_bs.loginDisconnectCls,
+                                             g_bs.loginDisconnectCtor, reason);
+                if (pkt && !env->ExceptionCheck()) {
+                    writeToChan(env, selfCh, pkt);
+                    LogTo("BServer: rejected protocol %d with outdated_client — "
+                          "a real 1.21.8 server does this, and client-side Via "
+                          "needs it to confirm our version", (int)announced);
+                    env->DeleteLocalRef(pkt);
+                } else if (env->ExceptionCheck()) {
+                    LogAndClearException(env, "version-reject/ctor");
+                }
+            } else if (env->ExceptionCheck()) {
+                LogAndClearException(env, "version-reject/reason");
+            }
+            if (reason) env->DeleteLocalRef(reason);
+            if (g_bs.channelCloseMid) {
+                jobject f = env->CallObjectMethod(selfCh, g_bs.channelCloseMid);
+                if (f) env->DeleteLocalRef(f);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+            return;
+        }
+
         ProtoState nextProto = wantStatus ? ProtoState::Status : ProtoState::Login;
         if (selfCh) setProtocolState(env, selfCh, nextProto);
         // A LOGIN intention is the real session; a STATUS one is just the server
@@ -3394,6 +3503,13 @@ void BSide_OnPacket(JNIEnv* env, jobject ctx, jobject msg) {
         g_bs.playSboundReady = false;
         g_bs.bAwaitingConfigAck.store(false, std::memory_order_release);
         g_bs.bState.store(BState::AwaitConfiguration, std::memory_order_release);
+        {
+            // Stale: these belong to the session B is leaving, and they are PLAY
+            // packets while B is now on CONFIGURATION.  Drop rather than flush.
+            std::lock_guard<std::mutex> l(g_bs.holdMu);
+            for (jobject p : g_bs.heldPackets) if (p) env->DeleteGlobalRef(p);
+            g_bs.heldPackets.clear();
+        }
         LogTo("reconfigure: B acknowledged; both directions back on CONFIGURATION, "
               "PLAY ProtocolInfo dropped for re-lift");
         return;
@@ -3409,6 +3525,9 @@ void BSide_OnPacket(JNIEnv* env, jobject ctx, jobject msg) {
         // B's decoder needs PLAY's serverbound ProtocolInfo, which is lifted
         // from A on A's first PLAY packet.  If that has not happened yet, leave
         // B's reads paused; the PLAY switch in BServer_ForwardToB finishes it.
+        // No flush here: our encoder is still on CONFIGURATION, so releasing
+        // PLAY packets now would send them under the old protocol.  The Play
+        // branch releases them right after it swaps.
         g_bs.bAwaitingConfigAck.store(false, std::memory_order_release);
         {
             std::lock_guard<std::mutex> l(g_bs.playSwapMu);
