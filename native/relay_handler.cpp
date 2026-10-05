@@ -97,8 +97,11 @@ void JNICALL Native_RelayChannelRead(JNIEnv* env,
     // BServer_ForwardToB decides which prefix is relevant for B's current state.
     static constexpr const char kGame[]   = "net.minecraft.network.protocol.game.";
     static constexpr const char kConfig[] = "net.minecraft.network.protocol.configuration.";
+    // common.* carries part of the configuration stream too (UpdateTags, brand).
+    static constexpr const char kCommon[] = "net.minecraft.network.protocol.common.";
     if (BServer_ShouldMirror() &&
-        (cls.rfind(kGame, 0) == 0 || cls.rfind(kConfig, 0) == 0)) {
+        (cls.rfind(kGame, 0) == 0 || cls.rfind(kConfig, 0) == 0 ||
+         cls.rfind(kCommon, 0) == 0)) {
         BServer_ForwardToB(env, ctx, msg);
     }
 
