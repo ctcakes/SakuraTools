@@ -2028,7 +2028,6 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         g_bs.componentLiteralMid = env->GetStaticMethodID(compCls, "literal",
             "(Ljava/lang/String;)Lnet/minecraft/network/chat/MutableComponent;");
         if (env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(compCls);
         g_bs.componentTranslatableMid = env->GetStaticMethodID(compCls, "translatable",
             "(Ljava/lang/String;)Lnet/minecraft/network/chat/MutableComponent;");
         if (env->ExceptionCheck()) env->ExceptionClear();
