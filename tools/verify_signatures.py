@@ -211,6 +211,29 @@ def main():
             failures.append(("critical", f"{cls}.{name}{want}", ""))
             print(f"  MISSING {cls}.{name}{want}")
 
+    # --- the C2S suppress list ---------------------------------------------
+    # relay_handler.cpp names these as bare simple names, so the dotted-class
+    # scan above cannot see them.  A typo here silently stops suppressing an
+    # input packet (harmless), but a name that has drifted out of the game
+    # usually means the surrounding classification is stale too -- and the
+    # 1.20.1 allow-list that this replaced is exactly what broke chunk loading.
+    suppress_src = next(
+        (p for p in args.sources if p.name == "relay_handler.cpp"), None)
+    if suppress_src is not None:
+        text = suppress_src.read_text(encoding="utf-8", errors="replace")
+        if "kSuppressed[] = {" in text:
+            block = text.split("kSuppressed[] = {", 1)[1].split("};", 1)[0]
+            names = re.findall(r'"(Serverbound\w+)"', block)
+            prefix = "net.minecraft.network.protocol.game."
+            print(f"\n== {len(names)} suppressed C2S packets ==")
+            for n in names:
+                if prefix + n in named:
+                    if args.verbose:
+                        print(f"  ok      {n}")
+                else:
+                    failures.append(("suppress-list", n, str(suppress_src)))
+                    print(f"  MISSING {n}  ({suppress_src.name})")
+
     print()
     if failures:
         print(f"FAILED: {len(failures)} unresolved reference(s)")

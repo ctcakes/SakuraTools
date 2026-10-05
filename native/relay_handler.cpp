@@ -109,6 +109,21 @@ void JNICALL Native_RelayChannelRead(JNIEnv* env,
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
+// While B is in PLAY it is the one driving the session, so A's *player intent*
+// is suppressed -- otherwise two clients would move the same entity and fight.
+//
+// Only intent, though.  A's connection still has to function on its own: the
+// client reports tick completion, acknowledges teleports, announces it has
+// loaded, and paces chunk delivery.  Dropping those does not merely mute A, it
+// stalls the world A is looking at -- and since B's view is a mirror of A's
+// stream, B freezes with it.  That is exactly what a 1.20.1-era allow-list
+// ("only ServerboundCustomPayloadPacket passes") did here once the port reached
+// 1.21.8, which added ServerboundClientTickEndPacket, ServerboundPlayerLoadedPacket
+// and ServerboundChunkBatchReceivedPacket since.
+//
+// This is deliberately a deny-list.  An unlisted packet gets through, so a
+// packet we fail to classify degrades to a little jitter rather than to a dead
+// session -- the opposite failure mode, and the recoverable one.
 bool shouldAllowC2S(const std::string& fqcn) {
 
     static constexpr const char kGamePrefix[] =
@@ -117,8 +132,79 @@ bool shouldAllowC2S(const std::string& fqcn) {
 
     if (!BServer_IsBActive()) return true;
 
-    const char* simple = fqcn.c_str() + (sizeof(kGamePrefix) - 1);
-    return std::strcmp(simple, "ServerboundCustomPayloadPacket") == 0;
+    // Player intent only.  Passed through on purpose, and worth naming so the
+    // next person does not "tidy" them into the list below:
+    //   ServerboundClientTickEndPacket        tick heartbeat
+    //   ServerboundAcceptTeleportationPacket  without it A is never teleported
+    //   ServerboundPlayerLoadedPacket         without it the server sends no chunks
+    //   ServerboundChunkBatchReceivedPacket   chunk flow control
+    //   ServerboundConfigurationAcknowledgedPacket  reconfiguration handshake
+    //   ServerboundClientCommandPacket        respawn / stats request
+    //   ServerboundChatAckPacket, ServerboundChatSessionUpdatePacket
+    //   ServerboundContainerSlotStateChangedPacket
+    //   ServerboundDebugSampleSubscriptionPacket
+    static const char* const kSuppressed[] = {
+        // movement / locomotion
+        "ServerboundMovePlayerPacket",
+        "ServerboundMoveVehiclePacket",
+        "ServerboundPaddleBoatPacket",
+        "ServerboundPlayerInputPacket",
+        "ServerboundTeleportToEntityPacket",
+        "ServerboundPlayerAbilitiesPacket",
+        // interaction with the world
+        "ServerboundPlayerActionPacket",
+        "ServerboundPlayerCommandPacket",
+        "ServerboundSwingPacket",
+        "ServerboundInteractPacket",
+        "ServerboundUseItemPacket",
+        "ServerboundUseItemOnPacket",
+        "ServerboundSetCarriedItemPacket",
+        "ServerboundPickItemFromBlockPacket",
+        "ServerboundPickItemFromEntityPacket",
+        "ServerboundSelectBundleItemPacket",
+        // containers / inventory / menus
+        "ServerboundContainerClickPacket",
+        "ServerboundContainerButtonClickPacket",
+        "ServerboundContainerClosePacket",
+        "ServerboundSetCreativeModeSlotPacket",
+        "ServerboundPlaceRecipePacket",
+        "ServerboundRecipeBookChangeSettingsPacket",
+        "ServerboundRecipeBookSeenRecipePacket",
+        "ServerboundRenameItemPacket",
+        "ServerboundSetBeaconPacket",
+        "ServerboundSelectTradePacket",
+        "ServerboundSeenAdvancementsPacket",
+        // text entry
+        "ServerboundChatPacket",
+        "ServerboundChatCommandPacket",
+        "ServerboundChatCommandSignedPacket",
+        "ServerboundCommandSuggestionPacket",
+        "ServerboundEditBookPacket",
+        "ServerboundSignUpdatePacket",
+        // server / world settings and operator tools
+        "ServerboundChangeDifficultyPacket",
+        "ServerboundLockDifficultyPacket",
+        "ServerboundChangeGameModePacket",
+        "ServerboundJigsawGeneratePacket",
+        "ServerboundSetJigsawBlockPacket",
+        "ServerboundSetStructureBlockPacket",
+        "ServerboundSetTestBlockPacket",
+        "ServerboundSetCommandBlockPacket",
+        "ServerboundSetCommandMinecartPacket",
+        "ServerboundTestInstanceBlockActionPacket",
+        "ServerboundBlockEntityTagQueryPacket",
+        "ServerboundEntityTagQueryPacket",
+    };
+
+    // Inner classes arrive as e.g. ServerboundMovePlayerPacket$Pos; the outer
+    // name is what identifies the intent.
+    std::string simple = fqcn.substr(sizeof(kGamePrefix) - 1);
+    size_t dollar = simple.find('$');
+    if (dollar != std::string::npos) simple.resize(dollar);
+
+    for (const char* s : kSuppressed)
+        if (simple == s) return false;
+    return true;
 }
 
 void JNICALL Native_RelayWrite(JNIEnv* env,
