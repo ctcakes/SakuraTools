@@ -2001,10 +2001,19 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         if (env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(compCls);
     }
-    if (g_bs.optionalCls) {
-        g_bs.optionalOfMid = env->GetStaticMethodID(g_bs.optionalCls, "of",
-            "(Ljava/lang/Object;)Ljava/util/Optional;");
-        if (env->ExceptionCheck()) env->ExceptionClear();
+    // Resolved here rather than reusing g_bs.optionalCls: that one is assigned
+    // further down this function, so at this point it is still null and the
+    // lookup would silently do nothing.
+    {
+        jclass optCls = env->FindClass("java/util/Optional");
+        if (optCls) {
+            if (!g_bs.optionalCls)
+                g_bs.optionalCls = static_cast<jclass>(env->NewGlobalRef(optCls));
+            g_bs.optionalOfMid = env->GetStaticMethodID(optCls, "of",
+                "(Ljava/lang/Object;)Ljava/util/Optional;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(optCls);
+        }
     }
     {
         jclass lofCls = env->FindClass("java/util/List");
@@ -3200,15 +3209,31 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
 // The number is fixed at 1.21.8 because that is what A speaks, and A's classes
 // are what encode and decode every packet that crosses this fake server.
 void sendStatusResponse(JNIEnv* env, jobject ch) {
-    if (!ch || !g_bs.statusResponsePacketCls || !g_bs.statusResponsePacketCtor ||
-        !g_bs.serverStatusCls || !g_bs.serverStatusCtor ||
-        !g_bs.statusVersionCls || !g_bs.statusVersionCtor ||
-        !g_bs.statusPlayersCls || !g_bs.statusPlayersCtor ||
-        !g_bs.componentCls || !g_bs.componentLiteralMid ||
-        !g_bs.optionalCls || !g_bs.optionalOfMid || !g_bs.optionalEmptyMid ||
-        !g_bs.listOfMid) {
-        LogTo("status: refs missing, cannot answer the ping");
-        return;
+    if (!ch) return;
+    // Name the missing piece rather than just "something is null" -- this is a
+    // silently-degrading path whose only symptom is a client that cannot detect
+    // the server version.
+    struct { const char* what; const void* got; } need[] = {
+        {"responseClass",   g_bs.statusResponsePacketCls},
+        {"responseCtor",    (const void*)g_bs.statusResponsePacketCtor},
+        {"serverStatusCls", g_bs.serverStatusCls},
+        {"serverStatusCtor",(const void*)g_bs.serverStatusCtor},
+        {"versionCls",      g_bs.statusVersionCls},
+        {"versionCtor",     (const void*)g_bs.statusVersionCtor},
+        {"playersCls",      g_bs.statusPlayersCls},
+        {"playersCtor",     (const void*)g_bs.statusPlayersCtor},
+        {"componentCls",    g_bs.componentCls},
+        {"componentLiteral",(const void*)g_bs.componentLiteralMid},
+        {"optionalCls",     g_bs.optionalCls},
+        {"optionalOf",      (const void*)g_bs.optionalOfMid},
+        {"optionalEmpty",   (const void*)g_bs.optionalEmptyMid},
+        {"listOf",          (const void*)g_bs.listOfMid},
+    };
+    for (auto& n : need) {
+        if (!n.got) {
+            LogTo("status: cannot answer the ping - %s is unresolved", n.what);
+            return;
+        }
     }
 
     jstring descStr = env->NewStringUTF("SakuraTools");
