@@ -2351,15 +2351,20 @@ void routeToA(JNIEnv* env, jobject packet) {
     env->DeleteLocalRef(target);
 }
 
+// B drives, so B's *intent* is injected into A's connection and reaches the real
+// server.  Only intent, though -- this used to forward everything except
+// CustomPayload, which pushed B's connection upkeep into A's session and broke
+// it in three separate ways:
+//   ClientTickEnd          encoded on A's connection while it was still
+//                          CONFIGURATION -> "Sending unknown packet
+//                          'serverbound/minecraft:client_tick_end'"
+//   AcceptTeleportation    carries B's teleport ids, meaningless on A's session
+//   MovePlayer             sent while B was still on "Loading terrain", so the
+//                          position disagreed with the server's -> A kicked for
+//                          illegal player movement
+// The predicate is shared with A's suppress list so the two can never drift.
 bool shouldRouteBToA(const std::string& fqcn) {
-    static constexpr const char kGamePrefix[] =
-        "net.minecraft.network.protocol.game.";
-
-    if (fqcn.rfind(kGamePrefix, 0) != 0) return false;
-    const char* simple = fqcn.c_str() + (sizeof(kGamePrefix) - 1);
-    if (std::strcmp(simple, "ServerboundCustomPayloadPacket") == 0) return false;
-
-    return true;
+    return IsPlayerIntentPacket(fqcn);
 }
 
 bool uuidToBytes(JNIEnv* env, jobject uuid, unsigned char out[16]) {

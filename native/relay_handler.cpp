@@ -124,18 +124,22 @@ void JNICALL Native_RelayChannelRead(JNIEnv* env,
 // This is deliberately a deny-list.  An unlisted packet gets through, so a
 // packet we fail to classify degrades to a little jitter rather than to a dead
 // session -- the opposite failure mode, and the recoverable one.
-bool shouldAllowC2S(const std::string& fqcn) {
+//
+// Defined outside the anonymous namespace: b_server.cpp routes B's packets
+// through the very same predicate (see relay_handler.h).
+}  // namespace
+
+bool IsPlayerIntentPacket(const std::string& fqcn) {
 
     static constexpr const char kGamePrefix[] =
         "net.minecraft.network.protocol.game.";
-    if (fqcn.rfind(kGamePrefix, 0) != 0) return true;
+    if (fqcn.rfind(kGamePrefix, 0) != 0) return false;
 
-    if (!BServer_IsBActive()) return true;
-
-    // Player intent only.  Passed through on purpose, and worth naming so the
-    // next person does not "tidy" them into the list below:
+    // What the player is *doing*, as opposed to what the connection needs to
+    // keep working.  Passed through on purpose, and worth naming so the next
+    // person does not "tidy" them into the list below:
     //   ServerboundClientTickEndPacket        tick heartbeat
-    //   ServerboundAcceptTeleportationPacket  without it A is never teleported
+    //   ServerboundAcceptTeleportationPacket  without it the client is never teleported
     //   ServerboundPlayerLoadedPacket         without it the server sends no chunks
     //   ServerboundChunkBatchReceivedPacket   chunk flow control
     //   ServerboundConfigurationAcknowledgedPacket  reconfiguration handshake
@@ -143,7 +147,7 @@ bool shouldAllowC2S(const std::string& fqcn) {
     //   ServerboundChatAckPacket, ServerboundChatSessionUpdatePacket
     //   ServerboundContainerSlotStateChangedPacket
     //   ServerboundDebugSampleSubscriptionPacket
-    static const char* const kSuppressed[] = {
+    static const char* const kPlayerIntent[] = {
         // movement / locomotion
         "ServerboundMovePlayerPacket",
         "ServerboundMoveVehiclePacket",
@@ -202,9 +206,18 @@ bool shouldAllowC2S(const std::string& fqcn) {
     size_t dollar = simple.find('$');
     if (dollar != std::string::npos) simple.resize(dollar);
 
-    for (const char* s : kSuppressed)
-        if (simple == s) return false;
-    return true;
+    for (const char* s : kPlayerIntent)
+        if (simple == s) return true;
+    return false;
+}
+
+namespace {
+
+// A drives, so A's intent is suppressed while B is in PLAY -- otherwise two
+// clients move the same entity and fight.  Its connection upkeep still passes.
+bool shouldAllowC2S(const std::string& fqcn) {
+    if (!BServer_IsBActive()) return true;
+    return !IsPlayerIntentPacket(fqcn);
 }
 
 void JNICALL Native_RelayWrite(JNIEnv* env,

@@ -221,11 +221,11 @@ def main():
         (p for p in args.sources if p.name == "relay_handler.cpp"), None)
     if suppress_src is not None:
         text = suppress_src.read_text(encoding="utf-8", errors="replace")
-        if "kSuppressed[] = {" in text:
-            block = text.split("kSuppressed[] = {", 1)[1].split("};", 1)[0]
+        if "kPlayerIntent[] = {" in text:
+            block = text.split("kPlayerIntent[] = {", 1)[1].split("};", 1)[0]
             names = re.findall(r'"(Serverbound\w+)"', block)
             prefix = "net.minecraft.network.protocol.game."
-            print(f"\n== {len(names)} suppressed C2S packets ==")
+            print(f"\n== {len(names)} player-intent packets ==")
             for n in names:
                 if prefix + n in named:
                     if args.verbose:
