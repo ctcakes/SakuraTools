@@ -15,22 +15,47 @@
 BOOL DoInject(DWORD dwProcessId, const char* cpDllFile,
               char* outMessage, int maxLen);
 
-// Substring of the Minecraft window title to look for.  Every launcher titles
-// the window differently ("KKCraft Client @ ...", "布吉岛", "Minecraft 1.21.8"),
-// so this is overridable on the command line rather than baked in.
-static wchar_t g_title_needle[256] = L"KKCraft";
+// Substrings of the Minecraft window title to look for.  Several are matched at
+// once because the title changes as the client boots: during NeoForge/ModLauncher
+// loading it mentions "neoforge", and only later does the launcher's own name
+// ("KKCraft Client @ ...") appear.  Matching the earliest one injects sooner,
+// which matters because B can only be held in the relay for 30 s.
+#define MAX_TITLE_NEEDLES 8
+static wchar_t g_title_needles[MAX_TITLE_NEEDLES][128];
+static int     g_title_needle_count = 0;
+static wchar_t g_title_display[512];
 
-static void set_title_needle(const char* utf8) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, g_title_needle,
-                                (int)(sizeof(g_title_needle) / sizeof(g_title_needle[0])));
-    if (n <= 0) g_title_needle[0] = 0;
+static void set_title_needles(const char* utf8) {
+    g_title_needle_count = 0;
+    g_title_display[0] = 0;
+
+    if (utf8 == NULL) return;
+    if (utf8[0] == 0) return;   // empty string => match any Java window
+
+    char buf[512];
+    strncpy(buf, utf8, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+
+    for (char* tok = strtok(buf, ","); tok && g_title_needle_count < MAX_TITLE_NEEDLES;
+         tok = strtok(NULL, ",")) {
+        while (*tok == ' ') ++tok;
+        if (!*tok) continue;
+        wchar_t* dst = g_title_needles[g_title_needle_count];
+        int n = MultiByteToWideChar(CP_UTF8, 0, tok, -1, dst, 128);
+        if (n <= 0) continue;
+        if (g_title_display[0]) wcscat(g_title_display, L" or ");
+        wcscat(g_title_display, dst);
+        ++g_title_needle_count;
+    }
 }
 
 static int usage(const char* argv0) {
     fprintf(stderr,
-            "usage: %s <dll-path> [window-title-substring]\n"
-            "  window-title-substring defaults to \"KKCraft\";\n"
-            "  pass \"\" to match any visible Java window.\n", argv0);
+            "usage: %s <dll-path> [window-title-substrings]\n"
+            "  Comma-separated title substrings, matched in order of nothing in\n"
+            "  particular - any match wins.  Default \"neoforge,KKCraft\", which\n"
+            "  catches the window as early as the NeoForge loading screen.\n"
+            "  Pass \"\" to match any visible Java window.\n", argv0);
     return 2;
 }
 
@@ -125,8 +150,10 @@ static ULONGLONG process_creation_time(DWORD pid) {
 }
 
 static BOOL title_matches(const wchar_t* title) {
-    if (g_title_needle[0] == 0) return TRUE;
-    return wcsstr(title, g_title_needle) != NULL;
+    if (g_title_needle_count == 0) return TRUE;   // no needles => any Java window
+    for (int i = 0; i < g_title_needle_count; ++i)
+        if (wcsstr(title, g_title_needles[i]) != NULL) return TRUE;
+    return FALSE;
 }
 
 static BOOL CALLBACK find_mc_window(HWND window, LPARAM param) {
@@ -158,9 +185,9 @@ static DWORD find_mc_process(void) {
 }
 
 static DWORD wait_for_mc_process(void) {
-    if (g_title_needle[0])
+    if (g_title_needle_count > 0)
         fprintf(stdout, "waiting for a visible Java window whose title contains \"%ls\"...\n",
-                g_title_needle);
+                g_title_display);
     else
         fprintf(stdout, "waiting for any visible Java window...\n");
     fflush(stdout);
@@ -219,7 +246,9 @@ int main(int argc, char** argv) {
     unsigned long pid = 0;
     const char* dll = argv[1];
 
-    if (argc == 3) set_title_needle(argv[2]);
+    // Default catches the window as early as the NeoForge loading screen, which
+    // is well before the launcher renames it to "KKCraft Client @ ...".
+    set_title_needles(argc == 3 ? argv[2] : "neoforge,KKCraft");
 
     if (GetFileAttributesA(dll) == INVALID_FILE_ATTRIBUTES) {
         fprintf(stderr, "dll not found: %s\n", dll);
@@ -231,7 +260,7 @@ int main(int argc, char** argv) {
     if (!is_elevated()) {
         fprintf(stdout, "not running as administrator - requesting elevation (UAC)...\n");
         fflush(stdout);
-        if (relaunch_elevated(dll, g_title_needle)) {
+        if (relaunch_elevated(dll, g_title_display)) {
             fprintf(stdout, "continuing in the elevated window.\n");
             return 0;
         }
@@ -253,7 +282,7 @@ int main(int argc, char** argv) {
 
     pid = wait_for_mc_process();
     fprintf(stdout, "matched Java window (title contains \"%ls\"), PID %lu\n",
-            g_title_needle[0] ? g_title_needle : L"*", pid);
+            g_title_needle_count > 0 ? g_title_display : L"*", pid);
     // A client that connects now sits in the relay.  It cannot be kept there
     // indefinitely -- the game's own ReadTimeoutHandler is 30 s and nothing can
     // be sent to it before the in-game proxy exists -- so this is the moment to

@@ -87,6 +87,7 @@ struct BServer {
     jmethodID pipelineRemoveNameMid   = nullptr;
     jmethodID pipelineGetHandlerMid   = nullptr;
     jmethodID pipelineReplaceMid      = nullptr;
+    jmethodID pipelineNamesMid        = nullptr;
 
     jclass    packetEncoderCls        = nullptr;
     jmethodID packetEncoderCtor       = nullptr;
@@ -563,6 +564,62 @@ jobject protocolInfoFor(ProtoState st, bool clientbound) {
     return nullptr;
 }
 
+// Dumps the live handler names.  netty installs the two protocol-sensitive
+// handlers under names that depend on the PacketFlow (encoder/decoder vs
+// outbound_config/inbound_config), and swapping the wrong one silently leaves
+// the real codec on the old protocol -- which shows up much later as packets
+// that fail to decode, so it is worth being able to see this.
+void logPipeline(JNIEnv* env, jobject pipeline, const char* where) {
+    if (!pipeline || !g_bs.pipelineNamesMid || !g_bs.listSizeMid || !g_bs.listGetMid)
+        return;
+    jobject names = env->CallObjectMethod(pipeline, g_bs.pipelineNamesMid);
+    if (!names || env->ExceptionCheck()) { if (env->ExceptionCheck()) env->ExceptionClear(); return; }
+
+    jint n = env->CallIntMethod(names, g_bs.listSizeMid);
+    std::string all;
+    for (jint i = 0; i < n; ++i) {
+        jobject s = env->CallObjectMethod(names, g_bs.listGetMid, i);
+        if (!s) continue;
+
+        std::string entry;
+        const char* c = env->GetStringUTFChars((jstring)s, nullptr);
+        if (c) { entry = c; env->ReleaseStringUTFChars((jstring)s, c); }
+
+        // Also resolve the handler's own class.  The pipeline name alone cannot
+        // tell a real PacketDecoder from an UnconfiguredPipelineHandler
+        // placeholder, and swapping the placeholder is silent.
+        jobject h = env->CallObjectMethod(pipeline, g_bs.pipelineGetHandlerMid, s);
+        if (h && !env->ExceptionCheck()) {
+            jclass hc = env->GetObjectClass(h);
+            jmethodID getName = env->GetMethodID(hc, "getName", "()Ljava/lang/String;");
+            if (getName) {
+                jobject cn = env->CallObjectMethod(hc, getName);
+                if (cn) {
+                    const char* cc = env->GetStringUTFChars((jstring)cn, nullptr);
+                    if (cc) {
+                        const char* slash = strrchr(cc, '.');
+                        entry += "("; entry += (slash ? slash + 1 : cc); entry += ")";
+                        env->ReleaseStringUTFChars((jstring)cn, cc);
+                    }
+                    env->DeleteLocalRef(cn);
+                }
+            }
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(hc);
+            env->DeleteLocalRef(h);
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+
+        if (!all.empty()) all += ", ";
+        all += entry;
+        env->DeleteLocalRef(s);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(names);
+    LogTo("pipeline[%s]: %s", where, all.c_str());
+}
+
 // Replaces whichever of `names` exists in the pipeline, normalising the name to
 // `canonical` so later lookups only have to probe one name.
 bool swapPipelineHandler(JNIEnv* env, jobject pipeline, const char* canonical,
@@ -672,6 +729,8 @@ void setProtocolState(JNIEnv* env, jobject channel, ProtoState st) {
     static const char* kOutboundNames[] = {"encoder", "outbound_config"};
     static const char* kInboundNames[]  = {"decoder", "inbound_config"};
 
+    logPipeline(env, pipeline, "before swap");
+
     swapPipelineHandler(env, pipeline, "encoder", kOutboundNames, 2,
                         g_bs.packetEncoderCls, g_bs.packetEncoderCtor,
                         protocolInfoFor(st, true), "outbound");
@@ -679,6 +738,7 @@ void setProtocolState(JNIEnv* env, jobject channel, ProtoState st) {
                         g_bs.packetDecoderCls, g_bs.packetDecoderCtor,
                         protocolInfoFor(st, false), "inbound");
 
+    logPipeline(env, pipeline, "after swap");
     env->DeleteLocalRef(pipeline);
 }
 
@@ -720,6 +780,7 @@ void JNICALL Native_ServerInit_initChannel(JNIEnv* env, jobject , jobject ch) {
     if (env->ExceptionCheck()) LogAndClearException(env, "  addLast(bside)");
     env->DeleteLocalRef(name);
     env->DeleteLocalRef(handler);
+    logPipeline(env, pipeline, "initChannel done");
     env->DeleteLocalRef(pipeline);
 
     {
@@ -732,8 +793,17 @@ void JNICALL Native_ServerInit_initChannel(JNIEnv* env, jobject , jobject ch) {
     LogTo("  B channel captured, state=AwaitHandshake");
 }
 
-void JNICALL Native_BSide_channelActive(JNIEnv* , jobject , jobject ) {
+void JNICALL Native_BSide_channelActive(JNIEnv* env, jobject , jobject ctx) {
     LogTo("BServer: B channelActive");
+    if (ctx) {
+        jobject p = env->CallObjectMethod(ctx, g_relay.netty.pipelineMid);
+        if (p && !env->ExceptionCheck()) {
+            logPipeline(env, p, "channelActive");
+            env->DeleteLocalRef(p);
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
 }
 
 // B can sit in CONFIGURATION for as long as it takes A to join a server, and
@@ -1119,6 +1189,7 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     g_bs.pipelineReplaceMid = env->GetMethodID(pipCls, "replace",
         "(Ljava/lang/String;Ljava/lang/String;Lio/netty/channel/ChannelHandler;)"
         "Lio/netty/channel/ChannelHandler;");
+    g_bs.pipelineNamesMid = env->GetMethodID(pipCls, "names", "()Ljava/util/List;");
     if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(pipCls);
 
