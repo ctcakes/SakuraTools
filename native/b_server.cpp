@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -226,6 +227,24 @@ struct BServer {
     bool bServerBound = false;
 
     bool      playProtocolReady = false;
+
+    // Per-B-connection PLAY switch bookkeeping, guarded by playSwapMu.
+    // bOutboundPlay: B's encoder has been moved to PLAY.
+    // bInboundPlayPending: B already acknowledged the end of configuration (its
+    // reads are paused by ProtocolSwapHandler) but A's PLAY ProtocolInfo was
+    // not available yet, so the decoder swap waits for it.
+    std::mutex playSwapMu;
+    bool      bOutboundPlay       = false;
+    bool      bInboundPlayPending = false;
+
+    // Runs protocol swaps on B's event loop, in order with writes queued there.
+    jclass    loopTaskCls             = nullptr;
+    jmethodID loopTaskCtor            = nullptr;
+    jmethodID channelEventLoopMid     = nullptr;
+    jmethodID executorExecuteMid      = nullptr;
+    jmethodID configSetAutoReadMid    = nullptr;
+    jclass    loginAckPacketCls       = nullptr;
+    jclass    finishConfigAckPacketCls = nullptr;
     std::atomic<bool> midSession{false};
     jmethodID mcGetConnectionMid      = nullptr;
     jclass    clientPacketListenerCls = nullptr;
@@ -592,7 +611,15 @@ void logPipeline(JNIEnv* env, jobject pipeline, const char* where) {
         jobject h = env->CallObjectMethod(pipeline, g_bs.pipelineGetHandlerMid, s);
         if (h && !env->ExceptionCheck()) {
             jclass hc = env->GetObjectClass(h);
-            jmethodID getName = env->GetMethodID(hc, "getName", "()Ljava/lang/String;");
+            static jmethodID getName = nullptr;
+            if (!getName) {
+                jclass classCls = env->FindClass("java/lang/Class");
+                if (classCls) {
+                    getName = env->GetMethodID(classCls, "getName", "()Ljava/lang/String;");
+                    env->DeleteLocalRef(classCls);
+                }
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
             if (getName) {
                 jobject cn = env->CallObjectMethod(hc, getName);
                 if (cn) {
@@ -621,8 +648,13 @@ void logPipeline(JNIEnv* env, jobject pipeline, const char* where) {
     LogTo("pipeline[%s]: %s", where, all.c_str());
 }
 
-// Swaps whichever of `names` is present for a freshly built handler, keeping the
-// handler's existing name and pipeline position.
+// Swaps whichever of `names` is present for a freshly built handler, keeping
+// its pipeline position and installing it under `installAs`.
+//
+// The canonical name matters: on every terminal packet vanilla's
+// ProtocolSwapHandler does addBefore/addAfter(ctx.name(), "inbound_config" /
+// "outbound_config", placeholder).  A real codec left sitting under the
+// placeholder's name makes that throw "Duplicate handler name".
 //
 // Deliberately remove + addBefore rather than ChannelPipeline.replace():
 // replace() rejects a new name that is already taken, and the old context is
@@ -632,8 +664,8 @@ void logPipeline(JNIEnv* env, jobject pipeline, const char* where) {
 // frees the name, and re-inserting before the old neighbour preserves position,
 // which matters because the decoder must stay ahead of the prepender/encoder.
 bool swapPipelineHandler(JNIEnv* env, jobject pipeline, const char* const* names,
-                         int nNames, jclass handlerCls, jmethodID handlerCtor,
-                         jobject pi, const char* tag) {
+                         int nNames, const char* installAs, jclass handlerCls,
+                         jmethodID handlerCtor, jobject pi, const char* tag) {
     if (!pi || !handlerCls || !handlerCtor) return false;
     if (!g_bs.pipelineNamesMid || !g_bs.listSizeMid || !g_bs.listGetMid) return false;
 
@@ -674,12 +706,12 @@ bool swapPipelineHandler(JNIEnv* env, jobject pipeline, const char* const* names
         env->DeleteLocalRef(list);
         return false;
     }
-    jobject nameGlobal = env->NewLocalRef(nameRef);
+    jstring newName = env->NewStringUTF(installAs);
 
     jobject handler = env->NewObject(handlerCls, handlerCtor, pi);
     if (!handler || env->ExceptionCheck()) {
         LogAndClearException(env, "proto/NewObject(handler)");
-        env->DeleteLocalRef(nameGlobal);
+        env->DeleteLocalRef(newName);
         env->DeleteLocalRef(nameRef);
         if (nextRef) env->DeleteLocalRef(nextRef);
         env->DeleteLocalRef(list);
@@ -695,10 +727,10 @@ bool swapPipelineHandler(JNIEnv* env, jobject pipeline, const char* const* names
         jobject ret = nullptr;
         if (nextRef) {
             ret = env->CallObjectMethod(pipeline, g_bs.pipelineAddBeforeMid,
-                                        nextRef, nameRef, handler);
+                                        nextRef, newName, handler);
         } else {
             ret = env->CallObjectMethod(pipeline, g_bs.pipelineAddLastMid,
-                                        nameRef, handler);
+                                        newName, handler);
         }
         ok = !env->ExceptionCheck();
         if (!ok) LogAndClearException(env, "proto/pipeline.addBefore");
@@ -707,12 +739,12 @@ bool swapPipelineHandler(JNIEnv* env, jobject pipeline, const char* const* names
 
     if (ok) {
         const char* c = env->GetStringUTFChars((jstring)nameRef, nullptr);
-        LogTo("proto: %s slot refilled (%s)", c ? c : "?", tag);
+        LogTo("proto: %s slot -> %s (%s)", c ? c : "?", installAs, tag);
         if (c) env->ReleaseStringUTFChars((jstring)nameRef, c);
     }
 
     env->DeleteLocalRef(handler);
-    env->DeleteLocalRef(nameGlobal);
+    env->DeleteLocalRef(newName);
     env->DeleteLocalRef(nameRef);
     if (nextRef) env->DeleteLocalRef(nextRef);
     env->DeleteLocalRef(list);
@@ -754,13 +786,15 @@ void ensureBPlayProtocol(JNIEnv* env, jobject aCtx) {
                 return pi;
             };
 
-            jobject cb = steal("encoder");
+            // A is a *client*: its decoder reads clientbound packets (what B's
+            // encoder must write) and its encoder writes serverbound ones.
+            jobject cb = steal("decoder");
             if (cb) {
                 if (g_bs.piPlayCbound) env->DeleteGlobalRef(g_bs.piPlayCbound);
                 g_bs.piPlayCbound = env->NewGlobalRef(cb);
                 env->DeleteLocalRef(cb);
             }
-            jobject sb = steal("decoder");
+            jobject sb = steal("encoder");
             if (sb) {
                 if (g_bs.piPlaySbound) env->DeleteGlobalRef(g_bs.piPlaySbound);
                 g_bs.piPlaySbound = env->NewGlobalRef(sb);
@@ -781,8 +815,20 @@ void ensureBPlayProtocol(JNIEnv* env, jobject aCtx) {
     g_bs.playProtocolReady = true;
 }
 
-void setProtocolState(JNIEnv* env, jobject channel, ProtoState st) {
-    if (!channel || !g_bs.channelPipelineMid || !g_bs.pipelineReplaceMid) return;
+// The two directions switch at different moments, exactly like vanilla's
+// server: the encoder right after the terminal clientbound packet has been
+// written (LoginFinished, FinishConfiguration), the decoder when B's terminal
+// serverbound packet arrives (intention, LoginAcknowledged, FinishConfiguration).
+//
+// Inbound also has to turn autoRead back on.  PacketDecoder, on decoding a
+// terminal packet, calls ProtocolSwapHandler.handleInboundTerminalPacket, which
+// sets autoRead=false and parks an UnconfiguredPipelineHandler$Inbound in its
+// slot; vanilla's InboundConfigurationTask re-enables reads after installing
+// the next decoder.  Skip that and the channel never reads again -- B's Hello
+// sits in FlowControlHandler forever and B times out on "Connecting".
+void setProtocolDirections(JNIEnv* env, jobject channel, ProtoState st,
+                           bool outbound, bool inbound) {
+    if (!channel || !g_bs.channelPipelineMid) return;
 
     jobject pipeline = env->CallObjectMethod(channel, g_bs.channelPipelineMid);
     if (!pipeline || env->ExceptionCheck()) { env->ExceptionClear(); return; }
@@ -792,15 +838,88 @@ void setProtocolState(JNIEnv* env, jobject channel, ProtoState st) {
 
     logPipeline(env, pipeline, "before swap");
 
-    swapPipelineHandler(env, pipeline, kOutboundNames, 2,
-                        g_bs.packetEncoderCls, g_bs.packetEncoderCtor,
-                        protocolInfoFor(st, true), "outbound");
-    swapPipelineHandler(env, pipeline, kInboundNames, 2,
-                        g_bs.packetDecoderCls, g_bs.packetDecoderCtor,
-                        protocolInfoFor(st, false), "inbound");
+    if (outbound) {
+        swapPipelineHandler(env, pipeline, kOutboundNames, 2, "encoder",
+                            g_bs.packetEncoderCls, g_bs.packetEncoderCtor,
+                            protocolInfoFor(st, true), "outbound");
+    }
+    if (inbound) {
+        bool ok = swapPipelineHandler(env, pipeline, kInboundNames, 2, "decoder",
+                                      g_bs.packetDecoderCls, g_bs.packetDecoderCtor,
+                                      protocolInfoFor(st, false), "inbound");
+        if (ok && g_bs.channelConfigMid && g_bs.configSetAutoReadMid) {
+            jobject cfg = env->CallObjectMethod(channel, g_bs.channelConfigMid);
+            if (cfg && !env->ExceptionCheck()) {
+                jobject r = env->CallObjectMethod(cfg, g_bs.configSetAutoReadMid, JNI_TRUE);
+                if (env->ExceptionCheck()) LogAndClearException(env, "proto/setAutoRead");
+                else if (r) env->DeleteLocalRef(r);
+                env->DeleteLocalRef(cfg);
+            } else if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+    }
 
     logPipeline(env, pipeline, "after swap");
     env->DeleteLocalRef(pipeline);
+}
+
+void setProtocolState(JNIEnv* env, jobject channel, ProtoState st) {
+    setProtocolDirections(env, channel, st, true, true);
+}
+
+// --- running swaps on B's event loop ----------------------------------------
+// Packets A forwards are written from A's event loop, so netty queues them as
+// tasks on B's loop.  A pipeline swap done directly from A's thread is *not* in
+// that queue and can overtake writes still waiting in it -- e.g. B's encoder
+// moved to PLAY before the queued FinishConfiguration got encoded.  Swaps
+// requested from outside B's loop are therefore queued on it too.
+struct LoopSwap { ProtoState st; bool outbound; bool inbound; };
+std::mutex           g_loopSwapMu;
+std::deque<LoopSwap> g_loopSwaps;
+
+void JNICALL Native_LoopTask_run(JNIEnv* env, jobject) {
+    LoopSwap op;
+    {
+        std::lock_guard<std::mutex> l(g_loopSwapMu);
+        if (g_loopSwaps.empty()) return;
+        op = g_loopSwaps.front();
+        g_loopSwaps.pop_front();
+    }
+    jobject ch;
+    { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
+    if (!ch) return;
+    setProtocolDirections(env, ch, op.st, op.outbound, op.inbound);
+    env->DeleteLocalRef(ch);
+}
+
+void postProtocolSwap(JNIEnv* env, jobject channel, ProtoState st,
+                      bool outbound, bool inbound) {
+    jobject loop = nullptr;
+    jobject task = nullptr;
+    if (g_bs.channelEventLoopMid && g_bs.executorExecuteMid &&
+        g_bs.loopTaskCls && g_bs.loopTaskCtor) {
+        loop = env->CallObjectMethod(channel, g_bs.channelEventLoopMid);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); loop = nullptr; }
+        if (loop) task = env->NewObject(g_bs.loopTaskCls, g_bs.loopTaskCtor);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); task = nullptr; }
+    }
+    if (!loop || !task) {
+        LogTo("proto: cannot reach B's event loop; swapping from this thread");
+        if (loop) env->DeleteLocalRef(loop);
+        setProtocolDirections(env, channel, st, outbound, inbound);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> l(g_loopSwapMu);
+        g_loopSwaps.push_back({st, outbound, inbound});
+    }
+    env->CallVoidMethod(loop, g_bs.executorExecuteMid, task);
+    if (env->ExceptionCheck()) {
+        LogAndClearException(env, "proto/eventLoop.execute");
+        std::lock_guard<std::mutex> l(g_loopSwapMu);
+        if (!g_loopSwaps.empty()) g_loopSwaps.pop_back();
+    }
+    env->DeleteLocalRef(task);
+    env->DeleteLocalRef(loop);
 }
 
 void JNICALL Native_ServerInit_initChannel(JNIEnv* env, jobject , jobject ch) {
@@ -849,6 +968,11 @@ void JNICALL Native_ServerInit_initChannel(JNIEnv* env, jobject , jobject ch) {
         if (g_bs.bChannel) env->DeleteGlobalRef(g_bs.bChannel);
         g_bs.bChannel = env->NewGlobalRef(ch);
         g_bs.bState.store(BState::AwaitHandshake, std::memory_order_release);
+    }
+    {
+        std::lock_guard<std::mutex> l(g_bs.playSwapMu);
+        g_bs.bOutboundPlay = false;
+        g_bs.bInboundPlayPending = false;
     }
 
     LogTo("  B channel captured, state=AwaitHandshake");
@@ -938,12 +1062,35 @@ void closeARemoteConnection(JNIEnv* env) {
     }
 }
 
-void JNICALL Native_BSide_channelInactive(JNIEnv* env, jobject , jobject ) {
-    LogTo("BServer: B channelInactive");
+void JNICALL Native_BSide_channelInactive(JNIEnv* env, jobject , jobject ctx) {
+    // B's multiplayer screen opens extra STATUS connections alongside the real
+    // login one.  Only the current B channel closing tears B's state down --
+    // a stale ping connection timing out must not orphan the login.
     {
         std::lock_guard<std::mutex> l(g_bs.bMu);
-        if (g_bs.bChannel) { env->DeleteGlobalRef(g_bs.bChannel); g_bs.bChannel = nullptr; }
+        bool current = false;
+        if (g_bs.bChannel && ctx) {
+            jobject p1 = env->CallObjectMethod(ctx, g_relay.netty.pipelineMid);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); p1 = nullptr; }
+            jobject p2 = env->CallObjectMethod(g_bs.bChannel, g_bs.channelPipelineMid);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); p2 = nullptr; }
+            current = p1 && p2 && env->IsSameObject(p1, p2);
+            if (p1) env->DeleteLocalRef(p1);
+            if (p2) env->DeleteLocalRef(p2);
+        }
+        if (!current) {
+            LogTo("BServer: stale B channel inactive (not the current one) - ignored");
+            return;
+        }
+        LogTo("BServer: B channelInactive");
+        env->DeleteGlobalRef(g_bs.bChannel);
+        g_bs.bChannel = nullptr;
         g_bs.bState.store(BState::AwaitHandshake, std::memory_order_release);
+    }
+    {
+        std::lock_guard<std::mutex> l(g_bs.playSwapMu);
+        g_bs.bOutboundPlay = false;
+        g_bs.bInboundPlayPending = false;
     }
     {
         std::lock_guard<std::mutex> gateLock(g_bConnMu);
@@ -1084,6 +1231,40 @@ bool defineMainGateClass(JNIEnv* env, jobject mcLoader) {
     return true;
 }
 
+bool defineLoopTaskClass(JNIEnv* env, jobject mcLoader) {
+    if (g_bs.loopTaskCls && g_bs.loopTaskCtor) return true;
+
+    std::string simple   = GenerateRandomClassName(2, 3);
+    std::string internal = MakeInternalName(GetTrampolinePackage(), simple);
+
+    ClassBuilder cb(internal, "java/lang/Object", 52);
+    cb.addInterface("java/lang/Runnable");
+    u2 objInit = cb.methodRef("java/lang/Object", "<init>", "()V");
+    std::vector<u1> ctor = {
+        0x2A, 0xB7, u1((objInit >> 8) & 0xFF), u1(objInit & 0xFF), 0xB1
+    };
+    cb.addCodedMethod("<init>", "()V", ACC_PUBLIC, ctor, 1, 1);
+    cb.addNativeMethod("run", "()V", ACC_PUBLIC | ACC_NATIVE);
+    std::vector<u1> bytes = cb.build();
+
+    jclass defined = env->DefineClass(internal.c_str(), mcLoader,
+                                      reinterpret_cast<const jbyte*>(bytes.data()),
+                                      static_cast<jsize>(bytes.size()));
+    if (!defined) { LogAndClearException(env, "BServer/DefineLoopTask"); return false; }
+    JNINativeMethod nats[] = {
+        {const_cast<char*>("run"), const_cast<char*>("()V"),
+         reinterpret_cast<void*>(&Native_LoopTask_run)},
+    };
+    if (env->RegisterNatives(defined, nats, 1) != 0) {
+        LogAndClearException(env, "BServer/RegisterLoopTask"); env->DeleteLocalRef(defined); return false;
+    }
+    g_bs.loopTaskCtor = env->GetMethodID(defined, "<init>", "()V");
+    g_bs.loopTaskCls = static_cast<jclass>(env->NewGlobalRef(defined));
+    env->DeleteLocalRef(defined);
+    LogTo("BServer: defined B event-loop task as %s", internal.c_str());
+    return true;
+}
+
 jboolean JNICALL Native_GameContext_hasInfiniteMaterials(JNIEnv*, jobject) {
     // Only the clientbound codecs consult this, to decide whether item stacks
     // carry the "infinite materials" component set.  We encode serverbound-side
@@ -1204,6 +1385,7 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     g_bs.channelAttrMid          = env->GetMethodID(chCls, "attr",          "(Lio/netty/util/AttributeKey;)Lio/netty/util/Attribute;");
     g_bs.channelConfigMid        = env->GetMethodID(chCls, "config",        "()Lio/netty/channel/ChannelConfig;");
     g_bs.channelCloseMid         = env->GetMethodID(chCls, "close",         "()Lio/netty/channel/ChannelFuture;");
+    g_bs.channelEventLoopMid     = env->GetMethodID(chCls, "eventLoop",     "()Lio/netty/channel/EventLoop;");
     if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(chCls);
 
@@ -1212,6 +1394,8 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     if (cfgCls) {
         g_bs.configSetOptionMid = env->GetMethodID(cfgCls, "setOption",
             "(Lio/netty/channel/ChannelOption;Ljava/lang/Object;)Z");
+        g_bs.configSetAutoReadMid = env->GetMethodID(cfgCls, "setAutoRead",
+            "(Z)Lio/netty/channel/ChannelConfig;");
         if (env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(cfgCls);
     }
@@ -1226,6 +1410,13 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         if (env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(optCls);
     }
+    jclass execCls = env->FindClass("java/util/concurrent/Executor");
+    if (execCls) {
+        g_bs.executorExecuteMid = env->GetMethodID(execCls, "execute", "(Ljava/lang/Runnable;)V");
+        env->DeleteLocalRef(execCls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
     jclass boolCls = env->FindClass("java/lang/Boolean");
     if (boolCls) {
         jfieldID f = env->GetStaticFieldID(boolCls, "TRUE", "Ljava/lang/Boolean;");
@@ -1579,6 +1770,17 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         env->DeleteLocalRef(intent);
     }
 
+    // B's two terminal serverbound packets after the handshake: each pauses
+    // B's reads until we install the next decoder.
+    jclass lAck = loadOrFind(env, mcLoader,
+        "net.minecraft.network.protocol.login.ServerboundLoginAcknowledgedPacket",
+        "Lnet/minecraft/network/protocol/login/ServerboundLoginAcknowledgedPacket;");
+    if (lAck) { g_bs.loginAckPacketCls = static_cast<jclass>(env->NewGlobalRef(lAck)); env->DeleteLocalRef(lAck); }
+    jclass fAck = loadOrFind(env, mcLoader,
+        "net.minecraft.network.protocol.configuration.ServerboundFinishConfigurationPacket",
+        "Lnet/minecraft/network/protocol/configuration/ServerboundFinishConfigurationPacket;");
+    if (fAck) { g_bs.finishConfigAckPacketCls = static_cast<jclass>(env->NewGlobalRef(fAck)); env->DeleteLocalRef(fAck); }
+
     jclass sReq = loadOrFind(env, mcLoader,
         "net.minecraft.network.protocol.status.ServerboundStatusRequestPacket",
         "Lnet/minecraft/network/protocol/status/ServerboundStatusRequestPacket;");
@@ -1868,6 +2070,7 @@ bool InstallBServer(JNIEnv* env) {
     // ProtocolInfo needs an instance of it.
     bool ok = defineInitClass(env, mcLoader) && defineHandlerClass(env, mcLoader)
            && defineGameContextClass(env, mcLoader)
+           && defineLoopTaskClass(env, mcLoader)
            && cacheJavaRefs(env, mcLoader) && bindServer(env, mcLoader);
     env->DeleteGlobalRef(mcLoader);
     if (ok) {
@@ -2314,8 +2517,10 @@ void completeLogin(JNIEnv* env, jobject hello) {
     jobject ch;
     { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
     if (ch) {
-        setProtocolState(env, ch, ProtoState::Configuration);
-        LogTo("login: protocol switched to CONFIGURATION (waiting for A's config stream)");
+        // Encoder only.  The decoder stays on LOGIN until B's
+        // LoginAcknowledged arrives (see BSide_OnPacket).
+        setProtocolDirections(env, ch, ProtoState::Configuration, true, false);
+        LogTo("login: encoder switched to CONFIGURATION (waiting for B's ack and A's config stream)");
         if (kGiveBOwnIdentity && g_bs.midSession.load(std::memory_order_acquire)) {
             LogTo("login: mid-session — rebuilding login for B from A's state");
             reconstructAndSendLoginToB(env, ch);
@@ -2709,9 +2914,15 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
 
     // Swap B onto the PLAY protocol before its first PLAY packet, using the
     // ProtocolInfos lifted from A's pipeline (correct registry access).
-    if (!g_bs.playProtocolReady) {
-        ensureBPlayProtocol(env, aCtx);
-        setProtocolState(env, ch, ProtoState::Play);
+    {
+        std::lock_guard<std::mutex> l(g_bs.playSwapMu);
+        if (!g_bs.bOutboundPlay) {
+            ensureBPlayProtocol(env, aCtx);
+            bool inbound = g_bs.bInboundPlayPending;
+            g_bs.bInboundPlayPending = false;
+            g_bs.bOutboundPlay = true;
+            postProtocolSwap(env, ch, ProtoState::Play, true, inbound);
+        }
     }
 
     if (!forwardBundleExpanded(env, ch, packet)) {
@@ -2765,6 +2976,37 @@ void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
 
     if (g_bs.helloPacketCls && env->IsInstanceOf(msg, g_bs.helloPacketCls)) {
         completeLogin(env, msg);
+        return;
+    }
+
+    if (g_bs.loginAckPacketCls && env->IsInstanceOf(msg, g_bs.loginAckPacketCls)) {
+        jobject ch;
+        { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
+        if (ch) {
+            setProtocolDirections(env, ch, ProtoState::Configuration, false, true);
+            env->DeleteLocalRef(ch);
+        }
+        LogTo("login: B acknowledged; decoder on CONFIGURATION");
+        return;
+    }
+
+    if (g_bs.finishConfigAckPacketCls && env->IsInstanceOf(msg, g_bs.finishConfigAckPacketCls)) {
+        // B's decoder needs PLAY's serverbound ProtocolInfo, which is lifted
+        // from A on A's first PLAY packet.  If that has not happened yet, leave
+        // B's reads paused; the PLAY switch in BServer_ForwardToB finishes it.
+        jobject ch;
+        { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
+        if (ch) {
+            std::lock_guard<std::mutex> l(g_bs.playSwapMu);
+            if (g_bs.bOutboundPlay) {
+                setProtocolDirections(env, ch, ProtoState::Play, false, true);
+                LogTo("config: B acknowledged finish; decoder on PLAY");
+            } else {
+                g_bs.bInboundPlayPending = true;
+                LogTo("config: B acknowledged finish; decoder waits for A's PLAY protocol");
+            }
+            env->DeleteLocalRef(ch);
+        }
         return;
     }
 
