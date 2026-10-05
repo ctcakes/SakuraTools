@@ -226,7 +226,10 @@ struct BServer {
 
     bool bServerBound = false;
 
-    bool      playProtocolReady = false;
+    bool      playProtocolReady = false;   // clientbound PLAY lifted from A
+    bool      playSboundReady   = false;   // serverbound PLAY lifted from A
+    jmethodID protocolInfoIdMid      = nullptr;
+    jobject   connectionProtocolPlay = nullptr;
 
     // Per-B-connection PLAY switch bookkeeping, guarded by playSwapMu.
     // bOutboundPlay: B's encoder has been moved to PLAY.
@@ -763,56 +766,73 @@ bool swapPipelineHandler(JNIEnv* env, jobject pipeline, const char* const* names
 // Connection dispatches them to the listener, so when the finish-config packet
 // goes past, A's swap has not happened yet; by the time the first PLAY packet
 // goes past, it has.  Hence: steal lazily, on the first PLAY packet.
+// Reads the ProtocolInfo out of one of A's codec handlers.  Returns null if the
+// slot currently holds an UnconfiguredPipelineHandler placeholder, or -- when
+// requirePlay -- if the codec is not on PLAY yet.
+jobject liftAProtocolInfo(JNIEnv* env, jobject aCtx, const char* name, bool requirePlay) {
+    if (!aCtx || !g_bs.pipelineGetHandlerMid) return nullptr;
+    jobject aPipeline = env->CallObjectMethod(aCtx, g_relay.netty.pipelineMid);
+    if (!aPipeline || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    jstring nm = env->NewStringUTF(name);
+    jobject h = env->CallObjectMethod(aPipeline, g_bs.pipelineGetHandlerMid, nm);
+    env->DeleteLocalRef(nm);
+    env->DeleteLocalRef(aPipeline);
+    if (!h || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    jclass hc = env->GetObjectClass(h);
+    jfieldID f = findFieldByDesc(hc, "Lnet/minecraft/network/ProtocolInfo;", false);
+    jobject pi = f ? env->GetObjectField(h, f) : nullptr;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); pi = nullptr; }
+    env->DeleteLocalRef(hc);
+    env->DeleteLocalRef(h);
+
+    if (pi && requirePlay && g_bs.protocolInfoIdMid && g_bs.connectionProtocolPlay) {
+        jobject id = env->CallObjectMethod(pi, g_bs.protocolInfoIdMid);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); id = nullptr; }
+        bool play = id && env->IsSameObject(id, g_bs.connectionProtocolPlay);
+        if (id) env->DeleteLocalRef(id);
+        if (!play) { env->DeleteLocalRef(pi); pi = nullptr; }
+    }
+    return pi;
+}
+
+// B's encoder needs PLAY *clientbound*, which is what A's decoder holds.  The
+// relay sits after A's decoder, so by the first PLAY packet it is on PLAY.
 void ensureBPlayProtocol(JNIEnv* env, jobject aCtx) {
     if (g_bs.playProtocolReady) return;
-
-    if (aCtx && g_bs.pipelineGetHandlerMid) {
-        jobject aPipeline = env->CallObjectMethod(aCtx, g_relay.netty.pipelineMid);
-        if (aPipeline && !env->ExceptionCheck()) {
-            auto steal = [&](const char* name) -> jobject {
-                jstring nm = env->NewStringUTF(name);
-                jobject h = env->CallObjectMethod(aPipeline, g_bs.pipelineGetHandlerMid, nm);
-                env->DeleteLocalRef(nm);
-                if (!h || env->ExceptionCheck()) {
-                    if (env->ExceptionCheck()) env->ExceptionClear();
-                    return nullptr;
-                }
-                jclass hc = env->GetObjectClass(h);
-                jfieldID f = findFieldByDesc(hc, "Lnet/minecraft/network/ProtocolInfo;", false);
-                jobject pi = f ? env->GetObjectField(h, f) : nullptr;
-                if (env->ExceptionCheck()) env->ExceptionClear();
-                env->DeleteLocalRef(hc);
-                env->DeleteLocalRef(h);
-                return pi;
-            };
-
-            // A is a *client*: its decoder reads clientbound packets (what B's
-            // encoder must write) and its encoder writes serverbound ones.
-            jobject cb = steal("decoder");
-            if (cb) {
-                if (g_bs.piPlayCbound) env->DeleteGlobalRef(g_bs.piPlayCbound);
-                g_bs.piPlayCbound = env->NewGlobalRef(cb);
-                env->DeleteLocalRef(cb);
-            }
-            jobject sb = steal("encoder");
-            if (sb) {
-                if (g_bs.piPlaySbound) env->DeleteGlobalRef(g_bs.piPlaySbound);
-                g_bs.piPlaySbound = env->NewGlobalRef(sb);
-                env->DeleteLocalRef(sb);
-            }
-            env->DeleteLocalRef(aPipeline);
-        } else if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-        }
+    jobject cb = liftAProtocolInfo(env, aCtx, "decoder", true);
+    if (cb) {
+        if (g_bs.piPlayCbound) env->DeleteGlobalRef(g_bs.piPlayCbound);
+        g_bs.piPlayCbound = env->NewGlobalRef(cb);
+        env->DeleteLocalRef(cb);
+        LogTo("play-proto: lifted A's clientbound PLAY ProtocolInfo (B's encoder)");
+    } else {
+        LogTo("play-proto: WARNING could not lift A's clientbound PLAY ProtocolInfo; "
+              "falling back to the template-bound one");
     }
-
-    if (g_bs.piPlayCbound && g_bs.piPlaySbound)
-        LogTo("play-proto: lifted A's PLAY ProtocolInfo (encoder+decoder) — "
-              "registries come from A");
-    else
-        LogTo("play-proto: WARNING could not lift A's ProtocolInfo; falling back "
-              "to template-bound ones, registry-carrying packets may fail");
     g_bs.playProtocolReady = true;
+}
+
+// B's decoder needs PLAY *serverbound*, which is A's encoder -- but A only moves
+// its encoder to PLAY after sending its own FinishConfiguration, which can be
+// later than the first PLAY packet it receives.  Lifting too early hands B a
+// CONFIGURATION decoder and every game packet B sends fails to decode.  So
+// retry until A's encoder actually reports PLAY.
+bool tryLiftPlaySbound(JNIEnv* env, jobject aCtx) {
+    if (g_bs.playSboundReady) return true;
+    jobject sb = liftAProtocolInfo(env, aCtx, "encoder", true);
+    if (!sb) return false;
+    if (g_bs.piPlaySbound) env->DeleteGlobalRef(g_bs.piPlaySbound);
+    g_bs.piPlaySbound = env->NewGlobalRef(sb);
+    env->DeleteLocalRef(sb);
+    g_bs.playSboundReady = true;
+    LogTo("play-proto: lifted A's serverbound PLAY ProtocolInfo (B's decoder)");
+    return true;
 }
 
 // The two directions switch at different moments, exactly like vanilla's
@@ -1474,6 +1494,24 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
 
     g_bs.protocolInfoCls = static_cast<jclass>(loadOrFind(env, mcLoader,
         "net.minecraft.network.ProtocolInfo", "Lnet/minecraft/network/ProtocolInfo;"));
+    if (g_bs.protocolInfoCls) {
+        g_bs.protocolInfoIdMid = findMethodByDesc(g_bs.protocolInfoCls,
+            "()Lnet/minecraft/network/ConnectionProtocol;", false);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+    jclass cpCls = loadOrFind(env, mcLoader, "net.minecraft.network.ConnectionProtocol",
+                              "Lnet/minecraft/network/ConnectionProtocol;");
+    if (cpCls) {
+        jfieldID f = env->GetStaticFieldID(cpCls, "PLAY", "Lnet/minecraft/network/ConnectionProtocol;");
+        if (f) {
+            jobject v = env->GetStaticObjectField(cpCls, f);
+            if (v) { g_bs.connectionProtocolPlay = env->NewGlobalRef(v); env->DeleteLocalRef(v); }
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(cpCls);
+    }
+    LogTo("proto: ProtocolInfo.id=%p ConnectionProtocol.PLAY=%p",
+          (void*)g_bs.protocolInfoIdMid, (void*)g_bs.connectionProtocolPlay);
     jclass encCls = loadOrFind(env, mcLoader, "net.minecraft.network.PacketEncoder",
                                "Lnet/minecraft/network/PacketEncoder;");
     if (encCls) {
@@ -2937,13 +2975,18 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
     // ProtocolInfos lifted from A's pipeline (correct registry access).
     {
         std::lock_guard<std::mutex> l(g_bs.playSwapMu);
+        bool outbound = false, inbound = false;
         if (!g_bs.bOutboundPlay) {
             ensureBPlayProtocol(env, aCtx);
-            bool inbound = g_bs.bInboundPlayPending;
-            g_bs.bInboundPlayPending = false;
             g_bs.bOutboundPlay = true;
-            postProtocolSwap(env, ch, ProtoState::Play, true, inbound);
+            outbound = true;
         }
+        if (g_bs.bInboundPlayPending && tryLiftPlaySbound(env, aCtx)) {
+            g_bs.bInboundPlayPending = false;
+            inbound = true;
+        }
+        if (outbound || inbound)
+            postProtocolSwap(env, ch, ProtoState::Play, outbound, inbound);
     }
 
     if (!forwardBundleExpanded(env, ch, packet)) {
@@ -3019,7 +3062,7 @@ void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
         { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
         if (ch) {
             std::lock_guard<std::mutex> l(g_bs.playSwapMu);
-            if (g_bs.bOutboundPlay) {
+            if (g_bs.playSboundReady) {
                 setProtocolDirections(env, ch, ProtoState::Play, false, true);
                 LogTo("config: B acknowledged finish; decoder on PLAY");
             } else {
