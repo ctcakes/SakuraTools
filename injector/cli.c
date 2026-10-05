@@ -25,11 +25,21 @@ static wchar_t g_title_needles[MAX_TITLE_NEEDLES][128];
 static int     g_title_needle_count = 0;
 static wchar_t g_title_display[512];
 
+// The argument as the user wrote it ("neoforge,KKCraft"), kept verbatim so the
+// elevated re-launch can forward it.  g_title_display is the human-readable
+// rendering and must never be passed on: the child would split it on commas and
+// end up searching for the literal text "neoforge or KKCraft".
+static char g_title_arg[512] = "neoforge,KKCraft";
+
 static void set_title_needles(const char* utf8) {
     g_title_needle_count = 0;
     g_title_display[0] = 0;
 
     if (utf8 == NULL) return;
+
+    strncpy(g_title_arg, utf8, sizeof(g_title_arg) - 1);
+    g_title_arg[sizeof(g_title_arg) - 1] = 0;
+
     if (utf8[0] == 0) return;   // empty string => match any Java window
 
     char buf[512];
@@ -79,17 +89,24 @@ static BOOL is_elevated(void) {
     return ok && elevation.TokenIsElevated;
 }
 
-static BOOL relaunch_elevated(const char* dll, const wchar_t* needle) {
+// needleUtf8 is the raw command-line argument, NOT the display string.
+static BOOL relaunch_elevated(const char* dll, const char* needleUtf8) {
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(NULL, exe, MAX_PATH) == 0) return FALSE;
 
     wchar_t wdll[MAX_PATH];
     if (MultiByteToWideChar(CP_UTF8, 0, dll, -1, wdll, MAX_PATH) <= 0) return FALSE;
 
-    // Quote both paths; a launcher directory with a space is common enough.
+    wchar_t wneedle[512];
+    if (MultiByteToWideChar(CP_UTF8, 0, needleUtf8, -1, wneedle,
+                            (int)(sizeof(wneedle) / sizeof(wneedle[0]))) <= 0)
+        wneedle[0] = 0;
+
+    // Quote both arguments; a launcher directory with a space is common enough,
+    // and an empty needle (match any window) must survive as an empty "" arg.
     wchar_t params[MAX_PATH * 2 + 16];
     _snwprintf(params, sizeof(params) / sizeof(params[0]), L"\"%ls\" \"%ls\"",
-               wdll, needle);
+               wdll, wneedle);
 
     SHELLEXECUTEINFOW sei;
     ZeroMemory(&sei, sizeof(sei));
@@ -260,7 +277,7 @@ int main(int argc, char** argv) {
     if (!is_elevated()) {
         fprintf(stdout, "not running as administrator - requesting elevation (UAC)...\n");
         fflush(stdout);
-        if (relaunch_elevated(dll, g_title_display)) {
+        if (relaunch_elevated(dll, g_title_arg)) {
             fprintf(stdout, "continuing in the elevated window.\n");
             return 0;
         }
