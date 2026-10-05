@@ -93,9 +93,13 @@ void LogAndClearException(JNIEnv* env, const char* where) {
         env->GetMethodID(thrCls, "toString", "()Ljava/lang/String;");
     jstring msg = (jstring)env->CallObjectMethod(t, toStringMid);
 
+    // LogTo, not Dbg: this runs on netty event-loop threads, and Dbg pops a
+    // *modal* MessageBox that blocks the loop until someone clicks OK.  A
+    // handled exception must never be able to stall a live connection.
     const char* c = msg ? env->GetStringUTFChars(msg, nullptr) : "<unknown>";
-    Dbg("[%s] %s", where, c);
+    LogTo("[exception] [%s] %s", where, c);
     if (msg) env->ReleaseStringUTFChars(msg, c);
+    env->DeleteLocalRef(msg);
 
     jmethodID pst = env->GetMethodID(thrCls, "printStackTrace", "()V");
     if (pst) env->CallVoidMethod(t, pst);

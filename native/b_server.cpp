@@ -88,6 +88,7 @@ struct BServer {
     jmethodID pipelineGetHandlerMid   = nullptr;
     jmethodID pipelineReplaceMid      = nullptr;
     jmethodID pipelineNamesMid        = nullptr;
+    jmethodID pipelineAddBeforeMid    = nullptr;
 
     jclass    packetEncoderCls        = nullptr;
     jmethodID packetEncoderCtor       = nullptr;
@@ -620,41 +621,101 @@ void logPipeline(JNIEnv* env, jobject pipeline, const char* where) {
     LogTo("pipeline[%s]: %s", where, all.c_str());
 }
 
-// Replaces whichever of `names` exists in the pipeline, normalising the name to
-// `canonical` so later lookups only have to probe one name.
-bool swapPipelineHandler(JNIEnv* env, jobject pipeline, const char* canonical,
-                         const char* const* names, int nNames,
-                         jclass handlerCls, jmethodID handlerCtor, jobject pi,
-                         const char* tag) {
+// Swaps whichever of `names` is present for a freshly built handler, keeping the
+// handler's existing name and pipeline position.
+//
+// Deliberately remove + addBefore rather than ChannelPipeline.replace():
+// replace() rejects a new name that is already taken, and the old context is
+// still registered while the new one is created -- so re-using the same name
+// throws "Duplicate handler name", and renaming to a name that a previous swap
+// already installed throws too.  Both happened in practice.  Removing first
+// frees the name, and re-inserting before the old neighbour preserves position,
+// which matters because the decoder must stay ahead of the prepender/encoder.
+bool swapPipelineHandler(JNIEnv* env, jobject pipeline, const char* const* names,
+                         int nNames, jclass handlerCls, jmethodID handlerCtor,
+                         jobject pi, const char* tag) {
     if (!pi || !handlerCls || !handlerCtor) return false;
+    if (!g_bs.pipelineNamesMid || !g_bs.listSizeMid || !g_bs.listGetMid) return false;
 
-    const char* found = nullptr;
-    for (int i = 0; i < nNames && !found; ++i) {
-        jstring nm = env->NewStringUTF(names[i]);
-        jobject existing = env->CallObjectMethod(pipeline, g_bs.pipelineGetHandlerMid, nm);
-        env->DeleteLocalRef(nm);
-        if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
-        if (existing) { found = names[i]; env->DeleteLocalRef(existing); }
+    jobject list = env->CallObjectMethod(pipeline, g_bs.pipelineNamesMid);
+    if (!list || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return false;
     }
-    if (!found) { LogTo("proto: no %s handler in pipeline", tag); return false; }
+    jint count = env->CallIntMethod(list, g_bs.listSizeMid);
+
+    // Locate the target by name, remembering what follows it.
+    jint idx = -1;
+    for (jint i = 0; i < count && idx < 0; ++i) {
+        jobject s = env->CallObjectMethod(list, g_bs.listGetMid, i);
+        if (!s) continue;
+        const char* c = env->GetStringUTFChars((jstring)s, nullptr);
+        if (c) {
+            for (int k = 0; k < nNames; ++k) {
+                if (std::strcmp(c, names[k]) == 0) { idx = i; break; }
+            }
+            env->ReleaseStringUTFChars((jstring)s, c);
+        }
+        env->DeleteLocalRef(s);
+    }
+    if (idx < 0) {
+        LogTo("proto: no %s handler in pipeline", tag);
+        env->DeleteLocalRef(list);
+        return false;
+    }
+
+    jobject nextRef = env->CallObjectMethod(list, g_bs.listGetMid, (jint)(idx + 1));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); nextRef = nullptr; }
+
+    jobject nameRef = env->CallObjectMethod(list, g_bs.listGetMid, idx);
+    if (env->ExceptionCheck() || !nameRef) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (nextRef) env->DeleteLocalRef(nextRef);
+        env->DeleteLocalRef(list);
+        return false;
+    }
+    jobject nameGlobal = env->NewLocalRef(nameRef);
 
     jobject handler = env->NewObject(handlerCls, handlerCtor, pi);
     if (!handler || env->ExceptionCheck()) {
         LogAndClearException(env, "proto/NewObject(handler)");
+        env->DeleteLocalRef(nameGlobal);
+        env->DeleteLocalRef(nameRef);
+        if (nextRef) env->DeleteLocalRef(nextRef);
+        env->DeleteLocalRef(list);
         return false;
     }
-    jstring oldName = env->NewStringUTF(found);
-    jstring newName = env->NewStringUTF(canonical);
-    jobject replaced = env->CallObjectMethod(pipeline, g_bs.pipelineReplaceMid,
-                                             oldName, newName, handler);
-    bool ok = !env->ExceptionCheck();
-    if (!ok) LogAndClearException(env, "proto/pipeline.replace");
-    else if (replaced) env->DeleteLocalRef(replaced);
 
-    env->DeleteLocalRef(newName);
-    env->DeleteLocalRef(oldName);
+    jobject removed = env->CallObjectMethod(pipeline, g_bs.pipelineRemoveNameMid, nameRef);
+    bool ok = !env->ExceptionCheck();
+    if (!ok) LogAndClearException(env, "proto/pipeline.remove");
+    else if (removed) env->DeleteLocalRef(removed);
+
+    if (ok) {
+        jobject ret = nullptr;
+        if (nextRef) {
+            ret = env->CallObjectMethod(pipeline, g_bs.pipelineAddBeforeMid,
+                                        nextRef, nameRef, handler);
+        } else {
+            ret = env->CallObjectMethod(pipeline, g_bs.pipelineAddLastMid,
+                                        nameRef, handler);
+        }
+        ok = !env->ExceptionCheck();
+        if (!ok) LogAndClearException(env, "proto/pipeline.addBefore");
+        else if (ret) env->DeleteLocalRef(ret);
+    }
+
+    if (ok) {
+        const char* c = env->GetStringUTFChars((jstring)nameRef, nullptr);
+        LogTo("proto: %s slot refilled (%s)", c ? c : "?", tag);
+        if (c) env->ReleaseStringUTFChars((jstring)nameRef, c);
+    }
+
     env->DeleteLocalRef(handler);
-    if (ok) LogTo("proto: %s <- %s (%s)", canonical, found, tag);
+    env->DeleteLocalRef(nameGlobal);
+    env->DeleteLocalRef(nameRef);
+    if (nextRef) env->DeleteLocalRef(nextRef);
+    env->DeleteLocalRef(list);
     return ok;
 }
 
@@ -731,10 +792,10 @@ void setProtocolState(JNIEnv* env, jobject channel, ProtoState st) {
 
     logPipeline(env, pipeline, "before swap");
 
-    swapPipelineHandler(env, pipeline, "encoder", kOutboundNames, 2,
+    swapPipelineHandler(env, pipeline, kOutboundNames, 2,
                         g_bs.packetEncoderCls, g_bs.packetEncoderCtor,
                         protocolInfoFor(st, true), "outbound");
-    swapPipelineHandler(env, pipeline, "decoder", kInboundNames, 2,
+    swapPipelineHandler(env, pipeline, kInboundNames, 2,
                         g_bs.packetDecoderCls, g_bs.packetDecoderCtor,
                         protocolInfoFor(st, false), "inbound");
 
@@ -1190,6 +1251,9 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         "(Ljava/lang/String;Ljava/lang/String;Lio/netty/channel/ChannelHandler;)"
         "Lio/netty/channel/ChannelHandler;");
     g_bs.pipelineNamesMid = env->GetMethodID(pipCls, "names", "()Ljava/util/List;");
+    g_bs.pipelineAddBeforeMid = env->GetMethodID(pipCls, "addBefore",
+        "(Ljava/lang/String;Ljava/lang/String;Lio/netty/channel/ChannelHandler;)"
+        "Lio/netty/channel/ChannelPipeline;");
     if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(pipCls);
 
