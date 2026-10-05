@@ -63,7 +63,16 @@ struct BServer {
     jclass    statusResponsePacketCls   = nullptr;
     jmethodID statusResponsePacketCtor  = nullptr;
     jclass    serverStatusCls           = nullptr;
-    jmethodID serverStatusCtor          = nullptr;
+    // Everything needed to answer a STATUS ping.  See sendStatusResponse().
+    jmethodID serverStatusCtor         = nullptr;
+    jclass    statusVersionCls         = nullptr;
+    jmethodID statusVersionCtor        = nullptr;
+    jclass    statusPlayersCls         = nullptr;
+    jmethodID statusPlayersCtor        = nullptr;
+    jclass    componentCls             = nullptr;
+    jmethodID componentLiteralMid      = nullptr;
+    jmethodID optionalOfMid            = nullptr;
+    jmethodID listOfMid                = nullptr;
     jclass    pongResponsePacketCls     = nullptr;
     jmethodID pongResponsePacketCtor    = nullptr;
     jclass    statusRequestPacketCls    = nullptr;
@@ -1959,6 +1968,53 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         env->DeleteLocalRef(ss);
     }
 
+    if (g_bs.serverStatusCls) {
+        g_bs.serverStatusCtor = env->GetMethodID(g_bs.serverStatusCls, "<init>",
+            "(Lnet/minecraft/network/chat/Component;Ljava/util/Optional;"
+            "Ljava/util/Optional;Ljava/util/Optional;Z)V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+    jclass sv = loadOrFind(env, mcLoader,
+        "net.minecraft.network.protocol.status.ServerStatus$Version",
+        "Lnet/minecraft/network/protocol/status/ServerStatus$Version;");
+    if (sv) {
+        g_bs.statusVersionCls = static_cast<jclass>(env->NewGlobalRef(sv));
+        g_bs.statusVersionCtor = env->GetMethodID(sv, "<init>", "(Ljava/lang/String;I)V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(sv);
+    }
+    jclass sp = loadOrFind(env, mcLoader,
+        "net.minecraft.network.protocol.status.ServerStatus$Players",
+        "Lnet/minecraft/network/protocol/status/ServerStatus$Players;");
+    if (sp) {
+        g_bs.statusPlayersCls = static_cast<jclass>(env->NewGlobalRef(sp));
+        g_bs.statusPlayersCtor = env->GetMethodID(sp, "<init>", "(IILjava/util/List;)V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(sp);
+    }
+    jclass compCls = loadOrFind(env, mcLoader, "net.minecraft.network.chat.Component",
+                                "Lnet/minecraft/network/chat/Component;");
+    if (compCls) {
+        g_bs.componentCls = static_cast<jclass>(env->NewGlobalRef(compCls));
+        g_bs.componentLiteralMid = env->GetStaticMethodID(compCls, "literal",
+            "(Ljava/lang/String;)Lnet/minecraft/network/chat/MutableComponent;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(compCls);
+    }
+    if (g_bs.optionalCls) {
+        g_bs.optionalOfMid = env->GetStaticMethodID(g_bs.optionalCls, "of",
+            "(Ljava/lang/Object;)Ljava/util/Optional;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+    {
+        jclass lofCls = env->FindClass("java/util/List");
+        if (lofCls) {
+            g_bs.listOfMid = env->GetStaticMethodID(lofCls, "of", "()Ljava/util/List;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(lofCls);
+        }
+    }
+
     jclass pp = loadOrFind(env, mcLoader,
         "net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket",
         "Lnet/minecraft/network/protocol/game/ClientboundPlayerPositionPacket;");
@@ -3132,6 +3188,76 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
     env->DeleteLocalRef(ch);
 }
 
+// Answer a STATUS ping.
+//
+// This is not decoration.  A vanilla client pings before connecting, and more
+// importantly client-side Via (ViaFabric / ViaFabricPlus) reads the protocol
+// number out of this reply to decide which version to translate to.  With no
+// reply it falls back to the client's own version, so a 1.21.11 client sends
+// 1.21.11-shaped packets at a 1.21.8 server and every login fails on a size
+// mismatch.  Advertising 772 is what lets it translate down and work.
+//
+// The number is fixed at 1.21.8 because that is what A speaks, and A's classes
+// are what encode and decode every packet that crosses this fake server.
+void sendStatusResponse(JNIEnv* env, jobject ch) {
+    if (!ch || !g_bs.statusResponsePacketCls || !g_bs.statusResponsePacketCtor ||
+        !g_bs.serverStatusCls || !g_bs.serverStatusCtor ||
+        !g_bs.statusVersionCls || !g_bs.statusVersionCtor ||
+        !g_bs.statusPlayersCls || !g_bs.statusPlayersCtor ||
+        !g_bs.componentCls || !g_bs.componentLiteralMid ||
+        !g_bs.optionalCls || !g_bs.optionalOfMid || !g_bs.optionalEmptyMid ||
+        !g_bs.listOfMid) {
+        LogTo("status: refs missing, cannot answer the ping");
+        return;
+    }
+
+    jstring descStr = env->NewStringUTF("SakuraTools");
+    jobject desc = env->CallStaticObjectMethod(g_bs.componentCls,
+                                               g_bs.componentLiteralMid, descStr);
+    env->DeleteLocalRef(descStr);
+
+    jstring verStr = env->NewStringUTF("1.21.8");
+    jobject version = env->NewObject(g_bs.statusVersionCls, g_bs.statusVersionCtor,
+                                     verStr, (jint)772);
+    env->DeleteLocalRef(verStr);
+
+    jclass listCls = env->FindClass("java/util/List");
+    jobject emptyList = listCls ? env->CallStaticObjectMethod(listCls, g_bs.listOfMid)
+                                : nullptr;
+    if (listCls) env->DeleteLocalRef(listCls);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); emptyList = nullptr; }
+
+    jobject players = env->NewObject(g_bs.statusPlayersCls, g_bs.statusPlayersCtor,
+                                     (jint)20, (jint)0, emptyList);
+    jobject optPlayers = env->CallStaticObjectMethod(g_bs.optionalCls,
+                                                     g_bs.optionalOfMid, players);
+    jobject optVersion = env->CallStaticObjectMethod(g_bs.optionalCls,
+                                                     g_bs.optionalOfMid, version);
+    jobject optFavicon = env->CallStaticObjectMethod(g_bs.optionalCls,
+                                                     g_bs.optionalEmptyMid);
+
+    if (env->ExceptionCheck()) {
+        LogAndClearException(env, "status/build");
+        return;
+    }
+
+    jobject status = env->NewObject(g_bs.serverStatusCls, g_bs.serverStatusCtor,
+                                    desc, optPlayers, optVersion, optFavicon,
+                                    (jboolean)JNI_FALSE);
+    if (!status || env->ExceptionCheck()) {
+        LogAndClearException(env, "status/ServerStatus ctor");
+        return;
+    }
+    jobject pkt = env->NewObject(g_bs.statusResponsePacketCls,
+                                 g_bs.statusResponsePacketCtor, status);
+    if (!pkt || env->ExceptionCheck()) {
+        LogAndClearException(env, "status/response ctor");
+        return;
+    }
+    writeToChan(env, ch, pkt);
+    LogTo("status: replied 1.21.8 / protocol 772 (client-side Via reads this)");
+}
+
 // The channel this packet actually arrived on.
 //
 // This must never be g_bs.bChannel.  A Minecraft client pings the server list
@@ -3186,6 +3312,11 @@ void BSide_OnPacket(JNIEnv* env, jobject ctx, jobject msg) {
         g_bs.bState.store(wantStatus ? BState::AwaitHandshake : BState::AwaitLogin,
                           std::memory_order_release);
         LogTo("BServer: intention → %s", wantStatus ? "STATUS" : "LOGIN");
+        return;
+    }
+
+    if (g_bs.statusRequestPacketCls && env->IsInstanceOf(msg, g_bs.statusRequestPacketCls)) {
+        sendStatusResponse(env, selfCh);
         return;
     }
 
