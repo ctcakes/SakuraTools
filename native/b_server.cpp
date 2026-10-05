@@ -252,6 +252,8 @@ struct BServer {
     jmethodID configSetAutoReadMid    = nullptr;
     jclass    loginAckPacketCls       = nullptr;
     jclass    finishConfigAckPacketCls = nullptr;
+    jclass    startConfigPacketCls     = nullptr;   // clientbound: re-enter configuration
+    jclass    configAckPacketCls       = nullptr;   // serverbound: B's answer to it
     std::atomic<bool> midSession{false};
     jmethodID mcGetConnectionMid      = nullptr;
     jclass    clientPacketListenerCls = nullptr;
@@ -1892,6 +1894,20 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         "Lnet/minecraft/network/protocol/configuration/ServerboundFinishConfigurationPacket;");
     if (fAck) { g_bs.finishConfigAckPacketCls = static_cast<jclass>(env->NewGlobalRef(fAck)); env->DeleteLocalRef(fAck); }
 
+    // Server transfer / reconfiguration: mid-PLAY the server sends
+    // ClientboundStartConfigurationPacket, the client answers with
+    // ServerboundConfigurationAcknowledgedPacket, and both sides walk back into
+    // CONFIGURATION to re-sync registries before returning to PLAY.  Without
+    // handling the re-entry B parks on "Reconfiguring..." forever.
+    jclass sCfg = loadOrFind(env, mcLoader,
+        "net.minecraft.network.protocol.game.ClientboundStartConfigurationPacket",
+        "Lnet/minecraft/network/protocol/game/ClientboundStartConfigurationPacket;");
+    if (sCfg) { g_bs.startConfigPacketCls = static_cast<jclass>(env->NewGlobalRef(sCfg)); env->DeleteLocalRef(sCfg); }
+    jclass cAck = loadOrFind(env, mcLoader,
+        "net.minecraft.network.protocol.game.ServerboundConfigurationAcknowledgedPacket",
+        "Lnet/minecraft/network/protocol/game/ServerboundConfigurationAcknowledgedPacket;");
+    if (cAck) { g_bs.configAckPacketCls = static_cast<jclass>(env->NewGlobalRef(cAck)); env->DeleteLocalRef(cAck); }
+
     jclass sReq = loadOrFind(env, mcLoader,
         "net.minecraft.network.protocol.status.ServerboundStatusRequestPacket",
         "Lnet/minecraft/network/protocol/status/ServerboundStatusRequestPacket;");
@@ -3066,6 +3082,14 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
             postProtocolSwap(env, ch, ProtoState::Play, outbound, inbound);
     }
 
+    // Log the opening move of a server transfer / reconfiguration.  The state
+    // change itself waits for B's acknowledgement (see BSide_OnPacket), because
+    // that is the moment B actually leaves PLAY.
+    if (g_bs.startConfigPacketCls && env->IsInstanceOf(packet, g_bs.startConfigPacketCls)) {
+        LogTo("reconfigure: A was told to re-enter CONFIGURATION (server transfer)");
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
     if (!forwardBundleExpanded(env, ch, packet)) {
         writeOneToBWithTabGuard(env, ch, packet);
     }
@@ -3117,6 +3141,31 @@ void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
 
     if (g_bs.helloPacketCls && env->IsInstanceOf(msg, g_bs.helloPacketCls)) {
         completeLogin(env, msg);
+        return;
+    }
+
+    // Reconfiguration.  B has just answered A's mirrored StartConfiguration and
+    // switched itself into CONFIGURATION, so we have to follow it there and let
+    // A's reconfiguration stream through -- otherwise B sits on "Reconfiguring...".
+    // A rebinds its PLAY ProtocolInfos against the new registries while it is
+    // reconfiguring, so the lifted ones have to be thrown away and taken again.
+    if (g_bs.configAckPacketCls && env->IsInstanceOf(msg, g_bs.configAckPacketCls)) {
+        jobject ch;
+        { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
+        if (ch) {
+            setProtocolDirections(env, ch, ProtoState::Configuration, true, true);
+            env->DeleteLocalRef(ch);
+        }
+        {
+            std::lock_guard<std::mutex> l(g_bs.playSwapMu);
+            g_bs.bOutboundPlay = false;
+            g_bs.bInboundPlayPending = false;
+        }
+        g_bs.playProtocolReady = false;
+        g_bs.playSboundReady = false;
+        g_bs.bState.store(BState::AwaitConfiguration, std::memory_order_release);
+        LogTo("reconfigure: B acknowledged; both directions back on CONFIGURATION, "
+              "PLAY ProtocolInfo dropped for re-lift");
         return;
     }
 
