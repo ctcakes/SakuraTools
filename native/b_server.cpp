@@ -1100,8 +1100,9 @@ void JNICALL Native_BSide_channelInactive(JNIEnv* env, jobject , jobject ctx) {
     if (g_bs.midSession.load(std::memory_order_acquire)) {
         LogTo("BServer: B gone; mid-session — leaving A's connection intact, A resumes control");
     } else {
-
-        closeARemoteConnection(env);
+        // 1.20.1 closed A here because A had been held back for B.  In 1.21.8
+        // A is never held, so B leaving must not take A's session down.
+        LogTo("BServer: B gone — A's connection left intact");
     }
 }
 
@@ -2881,8 +2882,28 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
     // B is parked here.  A's own configuration stream is what fills B's
     // registries, and A's ClientboundFinishConfigurationPacket is what finally
     // moves B into PLAY.
+    //
+    // Part of the configuration stream lives in protocol.common, not
+    // protocol.configuration -- most importantly ClientboundUpdateTagsPacket.
+    // Without it B's registries load with tags=0 and B disconnects with
+    // "Unbound tags in registry" on FinishConfiguration.  KeepAlive / Ping /
+    // Disconnect stay out: A answers the server's, and B has its own watchdog.
     if (state == BState::AwaitConfiguration) {
-        if (cls.rfind(kConfig, 0) != 0) { env->DeleteLocalRef(ch); return; }
+        static const char* kCommonMirrored[] = {
+            "net.minecraft.network.protocol.common.ClientboundUpdateTagsPacket",
+            "net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket",
+            "net.minecraft.network.protocol.common.ClientboundResourcePackPushPacket",
+            "net.minecraft.network.protocol.common.ClientboundResourcePackPopPacket",
+            "net.minecraft.network.protocol.common.ClientboundServerLinksPacket",
+            "net.minecraft.network.protocol.common.ClientboundCustomReportDetailsPacket",
+            "net.minecraft.network.protocol.common.ClientboundShowDialogPacket",
+            "net.minecraft.network.protocol.common.ClientboundClearDialogPacket",
+        };
+        bool mirrored = cls.rfind(kConfig, 0) == 0;
+        for (const char* c : kCommonMirrored) {
+            if (!mirrored && cls == c) mirrored = true;
+        }
+        if (!mirrored) { env->DeleteLocalRef(ch); return; }
 
         bool finish = g_bs.finishConfigPacketCls &&
                       env->IsInstanceOf(packet, g_bs.finishConfigPacketCls);
