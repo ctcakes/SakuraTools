@@ -79,6 +79,7 @@ struct BServer {
     jclass    pingRequestPacketCls      = nullptr;
     jfieldID  pingRequestPacketTimeFid  = nullptr;
     jfieldID  intentionPacketIntentFid  = nullptr;
+    jfieldID  intentionPacketProtoFid   = nullptr;   // protocolVersion (I)
 
     jobject   flowServerbound  = nullptr;
     jobject   flowClientbound  = nullptr;
@@ -1897,6 +1898,8 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         g_bs.intentPacketCls = static_cast<jclass>(env->NewGlobalRef(intent));
         g_bs.intentionPacketIntentFid = findFieldByDesc(intent,
             "Lnet/minecraft/network/protocol/handshake/ClientIntent;", false);
+        g_bs.intentionPacketProtoFid = env->GetFieldID(intent, "protocolVersion", "I");
+        if (env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(intent);
     }
 
@@ -3325,6 +3328,18 @@ void BSide_OnPacket(JNIEnv* env, jobject ctx, jobject msg) {
                 env->DeleteLocalRef(intent);
             }
         }
+        // What protocol the client says it speaks.  With a translator on the
+        // client side (ViaFabricPlus) this is the *translated-to* version, not
+        // the one the launcher shows -- the only reliable way to tell whether
+        // the translation actually happened.
+        jint announced = -1;
+        if (g_bs.intentionPacketProtoFid) {
+            announced = env->GetIntField(msg, g_bs.intentionPacketProtoFid);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); announced = -1; }
+        }
+        LogTo("BServer: handshake protocol version = %d (we speak 772 = 1.21.8)%s",
+              (int)announced, announced == 772 ? "  MATCH" : "  MISMATCH");
+
         ProtoState nextProto = wantStatus ? ProtoState::Status : ProtoState::Login;
         if (selfCh) setProtocolState(env, selfCh, nextProto);
         // A LOGIN intention is the real session; a STATUS one is just the server
