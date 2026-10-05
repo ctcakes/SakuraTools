@@ -254,6 +254,14 @@ int main(int argc, char** argv) {
     pid = wait_for_mc_process();
     fprintf(stdout, "matched Java window (title contains \"%ls\"), PID %lu\n",
             g_title_needle[0] ? g_title_needle : L"*", pid);
+    // A client that connects now sits in the relay.  It cannot be kept there
+    // indefinitely -- the game's own ReadTimeoutHandler is 30 s and nothing can
+    // be sent to it before the in-game proxy exists -- so this is the moment to
+    // say so, rather than as soon as the relay came up.
+    fprintf(stdout,
+            "connect the second client to 127.0.0.1:%u NOW if you have not already "
+            "(it has ~30 s before its own read timeout fires)\n", RELAY_LISTEN_PORT);
+    fflush(stdout);
 
     char msg[1024];
     BOOL ok = DoInject((DWORD)pid, dll, msg, (int)sizeof(msg));
@@ -267,5 +275,26 @@ int main(int argc, char** argv) {
         return 4;
     }
     fprintf(stdout, "in-game proxy ready - relay is forwarding\n");
+
+    // The bridge lives in *this* process, so returning here would close 25565
+    // and cut off every client the relay is holding -- which the second client
+    // sees as being disconnected part-way through joining.  Stay resident until
+    // the game goes away or the user stops us.
+    fprintf(stdout,
+            "\n"
+            "  relay running:  0.0.0.0:%u  ->  127.0.0.1:%u\n"
+            "  Keep this window open - closing it drops the second client.\n"
+            "  Press Ctrl+C to stop.\n"
+            "\n", RELAY_LISTEN_PORT, PROXY_UPSTREAM_PORT);
+    fflush(stdout);
+
+    HANDLE game = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+    if (game) {
+        WaitForSingleObject(game, INFINITE);
+        fprintf(stdout, "game process exited - shutting down the relay.\n");
+        CloseHandle(game);
+    } else {
+        for (;;) Sleep(1000);   // cannot watch the game; run until killed
+    }
     return 0;
 }
