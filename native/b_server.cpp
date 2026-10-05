@@ -92,6 +92,7 @@ struct BServer {
     jmethodID pipelineReplaceMid      = nullptr;
     jmethodID pipelineNamesMid        = nullptr;
     jmethodID pipelineAddBeforeMid    = nullptr;
+    jmethodID pipelineChannelMid      = nullptr;   // ChannelPipeline.channel()
 
     jclass    packetEncoderCls        = nullptr;
     jmethodID packetEncoderCtor       = nullptr;
@@ -1534,6 +1535,8 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         "(Ljava/lang/String;Ljava/lang/String;Lio/netty/channel/ChannelHandler;)"
         "Lio/netty/channel/ChannelHandler;");
     g_bs.pipelineNamesMid = env->GetMethodID(pipCls, "names", "()Ljava/util/List;");
+    g_bs.pipelineChannelMid = env->GetMethodID(pipCls, "channel",
+        "()Lio/netty/channel/Channel;");
     g_bs.pipelineAddBeforeMid = env->GetMethodID(pipCls, "addBefore",
         "(Ljava/lang/String;Ljava/lang/String;Lio/netty/channel/ChannelHandler;)"
         "Lio/netty/channel/ChannelPipeline;");
@@ -2338,12 +2341,21 @@ bool BServer_TryCaptureLiveConnection(JNIEnv* env) {
 
 namespace {
 
+// Write to one specific B connection.  Anything triggered by an inbound packet
+// must use this with that packet's own channel -- see channelOfCtx().
+void writeToChan(JNIEnv* env, jobject ch, jobject packet) {
+    if (!ch || !packet || !g_bs.channelWriteAndFlushMid) return;
+    env->CallObjectMethod(ch, g_bs.channelWriteAndFlushMid, packet);
+    if (env->ExceptionCheck()) LogAndClearException(env, "writeAndFlush");
+}
+
+// The current B session, for callers with no packet to key off: the config-phase
+// keep-alive watchdog, and A's relay deciding where to forward.
 void writeToB(JNIEnv* env, jobject packet) {
     jobject ch;
     { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
     if (!ch) return;
-    env->CallObjectMethod(ch, g_bs.channelWriteAndFlushMid, packet);
-    if (env->ExceptionCheck()) LogAndClearException(env, "writeAndFlush");
+    writeToChan(env, ch, packet);
     env->DeleteLocalRef(ch);
 }
 
@@ -2601,7 +2613,7 @@ bool reconstructAndSendLoginToB(JNIEnv* env, jobject ch) {
     return true;
 }
 
-void completeLogin(JNIEnv* env, jobject hello) {
+void completeLogin(JNIEnv* env, jobject selfCh, jobject hello) {
 
     if (!g_bs.helloPacketNameFid) { LogTo("login: no hello.name field"); return; }
     jstring jname = (jstring)env->GetObjectField(hello, g_bs.helloPacketNameFid);
@@ -2635,7 +2647,7 @@ void completeLogin(JNIEnv* env, jobject hello) {
         LogAndClearException(env, "login: LoginFinished ctor"); return;
     }
 
-    writeToB(env, lfp);
+    writeToChan(env, selfCh, lfp);
     env->DeleteLocalRef(lfp);
     LogTo("login: sent ClientboundLoginFinishedPacket to B");
 
@@ -2666,7 +2678,7 @@ void completeLogin(JNIEnv* env, jobject hello) {
         if (g_bs.keepAlivePacketCtor && g_bs.bChannel) {
             jobject ka = env->NewObject(g_bs.keepAlivePacketCls,
                                         g_bs.keepAlivePacketCtor, (jlong)1);
-            if (ka) { writeToB(env, ka); env->DeleteLocalRef(ka); }
+            if (ka) { writeToChan(env, selfCh, ka); env->DeleteLocalRef(ka); }
         }
         sendSelfInfoToB(env, uuid, jname);
     }
@@ -3097,10 +3109,36 @@ void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
     env->DeleteLocalRef(ch);
 }
 
-void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
+// The channel this packet actually arrived on.
+//
+// This must never be g_bs.bChannel.  A Minecraft client pings the server list
+// before connecting, and that ping is a *separate TCP connection* -- which our
+// ChannelInitializer accepts and which used to overwrite the single global.  The
+// client's "hello" then arrived on the real connection while the global still
+// pointed at the ping, so login success was written down the wrong socket and
+// the real connection never got it, failing as a client-side
+// "Failed to decode packet 'clientbound/minecraft:hello'".
+//
+// (Locals returned here are reclaimed when the native call returns.)
+jobject channelOfCtx(JNIEnv* env, jobject ctx) {
+    if (!ctx || !g_relay.netty.pipelineMid || !g_bs.pipelineChannelMid) return nullptr;
+    jobject pipeline = env->CallObjectMethod(ctx, g_relay.netty.pipelineMid);
+    if (!pipeline || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    jobject ch = env->CallObjectMethod(pipeline, g_bs.pipelineChannelMid);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); ch = nullptr; }
+    env->DeleteLocalRef(pipeline);
+    return ch;
+}
+
+void BSide_OnPacket(JNIEnv* env, jobject ctx, jobject msg) {
     std::string cls = classNameForB(env, msg);
     BState state = g_bs.bState.load(std::memory_order_acquire);
     LogTo("BServer: RX %s (state=%d)", cls.c_str(), (int)state);
+
+    jobject selfCh = channelOfCtx(env, ctx);
 
     if (g_bs.intentPacketCls && env->IsInstanceOf(msg, g_bs.intentPacketCls)) {
         // 1.21.8: the intention field is a ClientIntent enum, not a
@@ -3114,11 +3152,13 @@ void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
             }
         }
         ProtoState nextProto = wantStatus ? ProtoState::Status : ProtoState::Login;
-        jobject ch;
-        { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
-        if (ch) {
-            setProtocolState(env, ch, nextProto);
-            env->DeleteLocalRef(ch);
+        if (selfCh) setProtocolState(env, selfCh, nextProto);
+        // A LOGIN intention is the real session; a STATUS one is just the server
+        // list ping and must not become the forwarding target.
+        if (!wantStatus && selfCh) {
+            std::lock_guard<std::mutex> l(g_bs.bMu);
+            if (g_bs.bChannel) env->DeleteGlobalRef(g_bs.bChannel);
+            g_bs.bChannel = env->NewGlobalRef(selfCh);
         }
         g_bs.bState.store(wantStatus ? BState::AwaitHandshake : BState::AwaitLogin,
                           std::memory_order_release);
@@ -3133,14 +3173,14 @@ void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
         if (g_bs.pongResponsePacketCtor) {
             jobject pong = env->NewObject(g_bs.pongResponsePacketCls,
                                           g_bs.pongResponsePacketCtor, t);
-            if (pong) { writeToB(env, pong); env->DeleteLocalRef(pong); }
+            if (pong) { writeToChan(env, selfCh, pong); env->DeleteLocalRef(pong); }
             LogTo("BServer: replied Pong(%lld)", (long long)t);
         }
         return;
     }
 
     if (g_bs.helloPacketCls && env->IsInstanceOf(msg, g_bs.helloPacketCls)) {
-        completeLogin(env, msg);
+        completeLogin(env, selfCh, msg);
         return;
     }
 
@@ -3150,12 +3190,7 @@ void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
     // A rebinds its PLAY ProtocolInfos against the new registries while it is
     // reconfiguring, so the lifted ones have to be thrown away and taken again.
     if (g_bs.configAckPacketCls && env->IsInstanceOf(msg, g_bs.configAckPacketCls)) {
-        jobject ch;
-        { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
-        if (ch) {
-            setProtocolDirections(env, ch, ProtoState::Configuration, true, true);
-            env->DeleteLocalRef(ch);
-        }
+        if (selfCh) setProtocolDirections(env, selfCh, ProtoState::Configuration, true, true);
         {
             std::lock_guard<std::mutex> l(g_bs.playSwapMu);
             g_bs.bOutboundPlay = false;
@@ -3170,12 +3205,7 @@ void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
     }
 
     if (g_bs.loginAckPacketCls && env->IsInstanceOf(msg, g_bs.loginAckPacketCls)) {
-        jobject ch;
-        { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
-        if (ch) {
-            setProtocolDirections(env, ch, ProtoState::Configuration, false, true);
-            env->DeleteLocalRef(ch);
-        }
+        if (selfCh) setProtocolDirections(env, selfCh, ProtoState::Configuration, false, true);
         LogTo("login: B acknowledged; decoder on CONFIGURATION");
         return;
     }
@@ -3184,18 +3214,15 @@ void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
         // B's decoder needs PLAY's serverbound ProtocolInfo, which is lifted
         // from A on A's first PLAY packet.  If that has not happened yet, leave
         // B's reads paused; the PLAY switch in BServer_ForwardToB finishes it.
-        jobject ch;
-        { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
-        if (ch) {
+        {
             std::lock_guard<std::mutex> l(g_bs.playSwapMu);
             if (g_bs.playSboundReady) {
-                setProtocolDirections(env, ch, ProtoState::Play, false, true);
+                if (selfCh) setProtocolDirections(env, selfCh, ProtoState::Play, false, true);
                 LogTo("config: B acknowledged finish; decoder on PLAY");
             } else {
                 g_bs.bInboundPlayPending = true;
                 LogTo("config: B acknowledged finish; decoder waits for A's PLAY protocol");
             }
-            env->DeleteLocalRef(ch);
         }
         return;
     }
