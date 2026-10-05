@@ -7,6 +7,8 @@
 *.dll
 *.exe
 *.pdb
+*.exp
+*.ilk
 *.class
 
 # Runtime and crash artifacts
@@ -22,6 +24,10 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Python tooling
+__pycache__/
+*.pyc
 
 # Local caches
 .cache/

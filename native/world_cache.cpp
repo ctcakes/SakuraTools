@@ -47,8 +47,9 @@ WorldStateCache::Category WorldStateCache::categorize(std::string_view fqcn) {
     if (leaf == "ClientboundPlayerPositionPacket")           return Category::LatestPlayerPosition;
     if (leaf == "ClientboundPlayerInfoUpdatePacket" ||
         leaf == "ClientboundPlayerInfoRemovePacket")         return Category::AppendPlayerInfo;
+    // 1.21.8 dropped ClientboundAddPlayerPacket; players now come through
+    // ClientboundAddEntityPacket like every other entity.
     if (leaf == "ClientboundAddEntityPacket" ||
-        leaf == "ClientboundAddPlayerPacket" ||
         leaf == "ClientboundRemoveEntitiesPacket")           return Category::AppendEntity;
     if (leaf == "ClientboundLevelChunkWithLightPacket" ||
         leaf == "ClientboundForgetLevelChunkPacket")         return Category::AppendChunk;

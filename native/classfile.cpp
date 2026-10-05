@@ -118,6 +118,10 @@ u2 ClassBuilder::stringRef(std::string_view s) {
     return addEntry(CP_String, std::move(body));
 }
 
+void ClassBuilder::addInterface(std::string_view internalName) {
+    interfaces_.push_back(classRef(internalName));
+}
+
 void ClassBuilder::addNativeMethod(std::string_view name,
                                    std::string_view descriptor,
                                    u2 accessFlags) {
@@ -180,7 +184,9 @@ std::vector<u1> ClassBuilder::build() {
     be16(out, access_flags_);
     be16(out, thisClass);
     be16(out, superClass);
-    be16(out, 0);
+
+    be16(out, static_cast<u2>(interfaces_.size()));
+    for (u2 i : interfaces_) be16(out, i);
 
     be16(out, 0);
 

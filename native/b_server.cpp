@@ -24,7 +24,21 @@ constexpr const char* kChannelReadDesc     = "(Lio/netty/channel/ChannelHandlerC
 constexpr const char* kChannelActiveDesc   = "(Lio/netty/channel/ChannelHandlerContext;)V";
 constexpr const char* kChannelInactiveDesc = "(Lio/netty/channel/ChannelHandlerContext;)V";
 
-enum class BState { AwaitHandshake, AwaitLogin, Play };
+// 1.20.2 inserted CONFIGURATION between LOGIN and PLAY; B parks in
+// AwaitConfiguration until A's own configuration stream has been mirrored over.
+enum class BState { AwaitHandshake, AwaitLogin, AwaitConfiguration, Play };
+
+// Two possible identities for B.
+//   false (current) -- B mirrors A wholesale: A's own ClientboundLoginPacket and
+//                      PlayerInfoUpdate/team packets reach B untouched, so B
+//                      appears as A.  Nothing is synthesised, which is far less
+//                      fragile across versions.
+//   true            -- B gets its own offline identity, A is hidden from B's tab
+//                      list, and team/player-info packets are rewritten.  This
+//                      is what the 1.20.1 build did; the synthesised wire
+//                      formats below are 1.20.1-shaped and would need updating
+//                      for 1.21.8 before flipping this on.
+constexpr bool kGiveBOwnIdentity = false;
 
 struct BServer {
 
@@ -38,12 +52,10 @@ struct BServer {
     jclass    connectionCls              = nullptr;
     jmethodID connectionConfigureSerMid  = nullptr;
     jmethodID connectionSendMid          = nullptr;
-    jfieldID  connectionAttrProtocolFid  = nullptr;
 
-    jobject   protoHandshaking = nullptr;
-    jobject   protoLogin       = nullptr;
-    jobject   protoPlay        = nullptr;
-    jobject   protoStatus      = nullptr;
+    jclass    clientIntentCls  = nullptr;
+    jobject   intentLogin      = nullptr;
+    jobject   intentStatus     = nullptr;
 
     jclass    statusResponsePacketCls   = nullptr;
     jmethodID statusResponsePacketCtor  = nullptr;
@@ -74,16 +86,37 @@ struct BServer {
     jmethodID pipelineAddLastMid      = nullptr;
     jmethodID pipelineRemoveNameMid   = nullptr;
     jmethodID pipelineGetHandlerMid   = nullptr;
-    jclass    attributeCls            = nullptr;
-    jmethodID attributeSetMid         = nullptr;
-
-    jclass    bundlerInfoCls          = nullptr;
-    jfieldID  bundlerProviderFid      = nullptr;
+    jmethodID pipelineReplaceMid      = nullptr;
 
     jclass    packetEncoderCls        = nullptr;
-    jmethodID packetEncoderSetProtoMid = nullptr;
+    jmethodID packetEncoderCtor       = nullptr;
     jclass    packetDecoderCls        = nullptr;
-    jmethodID packetDecoderSetProtoMid = nullptr;
+    jmethodID packetDecoderCtor       = nullptr;
+
+    jclass    protocolInfoCls         = nullptr;
+    jmethodID simpleUnboundBindMid    = nullptr;
+    jmethodID unboundBindMid          = nullptr;
+    jmethodID rfbDecoratorMid         = nullptr;
+
+    jclass    registryAccessCls       = nullptr;
+    jfieldID  registryAccessEmptyFid  = nullptr;
+    jobject   registryAccessRef       = nullptr;
+
+    jclass    gameContextCls          = nullptr;
+    jmethodID gameContextCtor         = nullptr;
+
+    jobject   piHandshakeSbound       = nullptr;
+    jobject   piLoginCbound           = nullptr;
+    jobject   piLoginSbound           = nullptr;
+    jobject   piConfigCbound          = nullptr;
+    jobject   piConfigSbound          = nullptr;
+    jobject   piPlayCbound            = nullptr;
+    jobject   piPlaySbound            = nullptr;
+    jobject   piStatusCbound          = nullptr;
+    jobject   piStatusSbound          = nullptr;
+
+    jclass    finishConfigPacketCls   = nullptr;
+    jmethodID finishConfigPacketCtor  = nullptr;
 
     jclass    gameProfileCls          = nullptr;
     jmethodID gameProfileCtor         = nullptr;
@@ -92,7 +125,8 @@ struct BServer {
     jmethodID mcGetInstanceMid        = nullptr;
     jmethodID mcGetProfilePropsMid    = nullptr;
     jclass    friendlyBufCls          = nullptr;
-    jmethodID friendlyBufCtor         = nullptr;
+    jclass    registryBufCls          = nullptr;
+    jmethodID registryBufCtor         = nullptr;
     jmethodID fbbWriteByteMid         = nullptr;
     jmethodID fbbWriteBooleanMid      = nullptr;
     jmethodID fbbWriteVarIntMid       = nullptr;
@@ -121,8 +155,8 @@ struct BServer {
     jmethodID byteBufGetByteMid       = nullptr;
     jobject   bUuidObj                = nullptr;
 
-    jclass    addPlayerPacketCls      = nullptr;
-    jfieldID  addPlayerPacketUuidFid  = nullptr;
+    jclass    addEntityPacketCls      = nullptr;
+    jfieldID  addEntityPacketUuidFid  = nullptr;
 
     jclass    customPayloadPacketCls  = nullptr;
 
@@ -189,6 +223,7 @@ struct BServer {
 
     bool bServerBound = false;
 
+    bool      playProtocolReady = false;
     std::atomic<bool> midSession{false};
     jmethodID mcGetConnectionMid      = nullptr;
     jclass    clientPacketListenerCls = nullptr;
@@ -355,50 +390,295 @@ std::string classNameForB(JNIEnv* env, jobject o) {
     return out;
 }
 
-void setChannelAttr(JNIEnv* env, jobject channel, jfieldID keyFid, jclass keyOwnerCls,
-                    jobject value) {
-    jobject key = env->GetStaticObjectField(keyOwnerCls, keyFid);
-    if (!key) return;
-    jobject attr = env->CallObjectMethod(channel, g_bs.channelAttrMid, key);
-    if (env->ExceptionCheck() || !attr) { env->ExceptionClear(); return; }
-    env->CallVoidMethod(attr, g_bs.attributeSetMid, value);
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    env->DeleteLocalRef(attr);
-    env->DeleteLocalRef(key);
+// 1.20.5+ packet constructors and codecs take a RegistryFriendlyByteBuf, which
+// carries the RegistryAccess the codecs resolve against.  Every buffer we
+// synthesise by hand has to be built on one of these instead of a plain
+// FriendlyByteBuf.  A's own RegistryAccess is picked up opportunistically (see
+// BServer_TryCaptureLiveConnection); until then we fall back to
+// RegistryAccess.EMPTY, which is enough for the login/status/handshake codecs.
+jobject registryAccessForBuf(JNIEnv* env) {
+    if (g_bs.registryAccessRef) return g_bs.registryAccessRef;
+    if (!g_bs.registryAccessCls || !g_bs.registryAccessEmptyFid) return nullptr;
+    jobject e = env->GetStaticObjectField(g_bs.registryAccessCls,
+                                          g_bs.registryAccessEmptyFid);
+    if (!e || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    g_bs.registryAccessRef = env->NewGlobalRef(e);
+    env->DeleteLocalRef(e);
+    return g_bs.registryAccessRef;
 }
 
-void setProtocolState(JNIEnv* env, jobject channel, jobject protoValue) {
-    if (!channel || !protoValue) return;
-    if (g_bs.connectionAttrProtocolFid)
-        setChannelAttr(env, channel, g_bs.connectionAttrProtocolFid, g_bs.connectionCls, protoValue);
-    if (g_bs.bundlerProviderFid && g_bs.bundlerInfoCls)
-        setChannelAttr(env, channel, g_bs.bundlerProviderFid, g_bs.bundlerInfoCls, protoValue);
+jobject wrapRegistryBuf(JNIEnv* env, jobject byteBuf) {
+    if (!byteBuf || !g_bs.registryBufCls || !g_bs.registryBufCtor) return nullptr;
+    jobject ra = registryAccessForBuf(env);
+    if (!ra) { LogTo("buf: no RegistryAccess available"); return nullptr; }
+    jobject buf = env->NewObject(g_bs.registryBufCls, g_bs.registryBufCtor, byteBuf, ra);
+    if (!buf || env->ExceptionCheck()) {
+        LogAndClearException(env, "wrapRegistryBuf");
+        return nullptr;
+    }
+    return buf;
+}
+
+jobject newWriteBuf(JNIEnv* env) {
+    if (!g_bs.unpooledCls || !g_bs.unpooledBufferMid) return nullptr;
+    jobject bb = env->CallStaticObjectMethod(g_bs.unpooledCls, g_bs.unpooledBufferMid);
+    if (!bb || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    jobject buf = wrapRegistryBuf(env, bb);
+    env->DeleteLocalRef(bb);
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// 1.21.8 protocol plumbing.
+//
+// 1.20.1 switched protocol state by poking Connection.ATTRIBUTE_PROTOCOL and
+// calling setProtocol() on the encoder/decoder handlers.  Neither exists any
+// more.  In 1.21.8 the encoder/decoder are built around an immutable
+// ProtocolInfo, and the state change is done by *swapping those two handlers*
+// in the pipeline -- which is exactly what Connection.setupOutboundProtocol /
+// setupInboundProtocol do internally, except they also want a PacketListener.
+// We have no listener (our B-side pipeline is ours alone), so we do the swap
+// ourselves.
+//
+// Handler names: Connection.configureSerialization installs the two sides
+// under different names depending on which one is "real" for that PacketFlow.
+// A serverbound pipeline gets a real "decoder" and a placeholder named
+// "outbound_config"; once a protocol is chosen the placeholder is renamed to
+// "encoder".  We therefore probe both names and normalise to encoder/decoder.
+// ---------------------------------------------------------------------------
+
+enum class ProtoState { Handshake, Login, Configuration, Play, Status };
+
+jobject bindProtocolInfoField(JNIEnv* env, const char* ownerDot, const char* fieldName) {
+    jobject loader = GetMinecraftClassLoader(env, g_jvmti);
+    if (!loader) return nullptr;
+    jclass owner = LoadClassInLoader(env, loader, ownerDot);
+    env->DeleteGlobalRef(loader);
+    if (!owner) { LogTo("proto: class %s not found", ownerDot); return nullptr; }
+
+    jfieldID f = env->GetStaticFieldID(owner, fieldName, "Lnet/minecraft/network/ProtocolInfo;");
+    if (!f) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        LogTo("proto: %s.%s missing", ownerDot, fieldName);
+        env->DeleteLocalRef(owner);
+        return nullptr;
+    }
+    jobject v = env->GetStaticObjectField(owner, f);
+    env->DeleteLocalRef(owner);
+    if (!v || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    jobject g = env->NewGlobalRef(v);
+    env->DeleteLocalRef(v);
+    return g;
+}
+
+// GameProtocols exposes *templates* rather than ready ProtocolInfos: the game
+// codecs are parameterised by the registry access, so they must be bound.
+jobject bindProtocolTemplate(JNIEnv* env, const char* ownerDot, const char* fieldName,
+                             bool needsContext) {
+    if (!g_bs.registryBufCls || !g_bs.rfbDecoratorMid) return nullptr;
+
+    jobject loader = GetMinecraftClassLoader(env, g_jvmti);
+    if (!loader) return nullptr;
+    jclass owner = LoadClassInLoader(env, loader, ownerDot);
+    env->DeleteGlobalRef(loader);
+    if (!owner) { LogTo("proto: template class %s not found", ownerDot); return nullptr; }
+
+    const char* tmplDesc = needsContext
+        ? "Lnet/minecraft/network/protocol/UnboundProtocol;"
+        : "Lnet/minecraft/network/protocol/SimpleUnboundProtocol;";
+    jfieldID f = env->GetStaticFieldID(owner, fieldName, tmplDesc);
+    if (!f) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        LogTo("proto: template %s.%s missing", ownerDot, fieldName);
+        env->DeleteLocalRef(owner);
+        return nullptr;
+    }
+    jobject tmpl = env->GetStaticObjectField(owner, f);
+    env->DeleteLocalRef(owner);
+    if (!tmpl || env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+
+    jobject ra = g_bs.registryAccessRef;
+    if (!ra && g_bs.registryAccessCls && g_bs.registryAccessEmptyFid) {
+        jobject e = env->GetStaticObjectField(g_bs.registryAccessCls,
+                                              g_bs.registryAccessEmptyFid);
+        if (e && !env->ExceptionCheck()) {
+            g_bs.registryAccessRef = env->NewGlobalRef(e);
+            ra = g_bs.registryAccessRef;
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        if (e) env->DeleteLocalRef(e);
+    }
+    if (!ra) { LogTo("proto: no RegistryAccess available for %s", fieldName); env->DeleteLocalRef(tmpl); return nullptr; }
+
+    jobject decorator = env->CallStaticObjectMethod(g_bs.registryBufCls,
+                                                    g_bs.rfbDecoratorMid, ra);
+    if (!decorator || env->ExceptionCheck()) {
+        LogAndClearException(env, "proto/decorator");
+        env->DeleteLocalRef(tmpl);
+        return nullptr;
+    }
+
+    jobject pi = nullptr;
+    if (needsContext) {
+        jobject ctx = env->NewObject(g_bs.gameContextCls, g_bs.gameContextCtor);
+        if (ctx && !env->ExceptionCheck()) {
+            pi = env->CallObjectMethod(tmpl, g_bs.unboundBindMid, decorator, ctx);
+        }
+        if (env->ExceptionCheck()) LogAndClearException(env, "proto/bind(context)");
+        if (ctx) env->DeleteLocalRef(ctx);
+    } else {
+        pi = env->CallObjectMethod(tmpl, g_bs.simpleUnboundBindMid, decorator);
+        if (env->ExceptionCheck()) LogAndClearException(env, "proto/bind");
+    }
+    env->DeleteLocalRef(decorator);
+    env->DeleteLocalRef(tmpl);
+    if (!pi) return nullptr;
+
+    jobject g = env->NewGlobalRef(pi);
+    env->DeleteLocalRef(pi);
+    return g;
+}
+
+jobject protocolInfoFor(ProtoState st, bool clientbound) {
+    switch (st) {
+        case ProtoState::Handshake:     return clientbound ? nullptr : g_bs.piHandshakeSbound;
+        case ProtoState::Login:         return clientbound ? g_bs.piLoginCbound  : g_bs.piLoginSbound;
+        case ProtoState::Configuration: return clientbound ? g_bs.piConfigCbound : g_bs.piConfigSbound;
+        case ProtoState::Play:          return clientbound ? g_bs.piPlayCbound   : g_bs.piPlaySbound;
+        case ProtoState::Status:        return clientbound ? g_bs.piStatusCbound : g_bs.piStatusSbound;
+    }
+    return nullptr;
+}
+
+// Replaces whichever of `names` exists in the pipeline, normalising the name to
+// `canonical` so later lookups only have to probe one name.
+bool swapPipelineHandler(JNIEnv* env, jobject pipeline, const char* canonical,
+                         const char* const* names, int nNames,
+                         jclass handlerCls, jmethodID handlerCtor, jobject pi,
+                         const char* tag) {
+    if (!pi || !handlerCls || !handlerCtor) return false;
+
+    const char* found = nullptr;
+    for (int i = 0; i < nNames && !found; ++i) {
+        jstring nm = env->NewStringUTF(names[i]);
+        jobject existing = env->CallObjectMethod(pipeline, g_bs.pipelineGetHandlerMid, nm);
+        env->DeleteLocalRef(nm);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+        if (existing) { found = names[i]; env->DeleteLocalRef(existing); }
+    }
+    if (!found) { LogTo("proto: no %s handler in pipeline", tag); return false; }
+
+    jobject handler = env->NewObject(handlerCls, handlerCtor, pi);
+    if (!handler || env->ExceptionCheck()) {
+        LogAndClearException(env, "proto/NewObject(handler)");
+        return false;
+    }
+    jstring oldName = env->NewStringUTF(found);
+    jstring newName = env->NewStringUTF(canonical);
+    jobject replaced = env->CallObjectMethod(pipeline, g_bs.pipelineReplaceMid,
+                                             oldName, newName, handler);
+    bool ok = !env->ExceptionCheck();
+    if (!ok) LogAndClearException(env, "proto/pipeline.replace");
+    else if (replaced) env->DeleteLocalRef(replaced);
+
+    env->DeleteLocalRef(newName);
+    env->DeleteLocalRef(oldName);
+    env->DeleteLocalRef(handler);
+    if (ok) LogTo("proto: %s <- %s (%s)", canonical, found, tag);
+    return ok;
+}
+
+// The PLAY ProtocolInfos must be bound against A's *real* RegistryAccess: the
+// codecs resolve registry ids through the buffer, so one bound against
+// RegistryAccess.EMPTY cannot encode a chunk section, an entity type or an item
+// stack.  Rather than rebuild it, we lift the two ProtocolInfos straight out of
+// A's live pipeline -- they are already bound with the right registry, and B
+// runs the same version so they are exactly the ones B needs.
+//
+// This has to happen after A's own configuration has finished, because only
+// then does A's pipeline hold the PLAY handlers.  The relay sees packets before
+// Connection dispatches them to the listener, so when the finish-config packet
+// goes past, A's swap has not happened yet; by the time the first PLAY packet
+// goes past, it has.  Hence: steal lazily, on the first PLAY packet.
+void ensureBPlayProtocol(JNIEnv* env, jobject aCtx) {
+    if (g_bs.playProtocolReady) return;
+
+    if (aCtx && g_bs.pipelineGetHandlerMid) {
+        jobject aPipeline = env->CallObjectMethod(aCtx, g_relay.netty.pipelineMid);
+        if (aPipeline && !env->ExceptionCheck()) {
+            auto steal = [&](const char* name) -> jobject {
+                jstring nm = env->NewStringUTF(name);
+                jobject h = env->CallObjectMethod(aPipeline, g_bs.pipelineGetHandlerMid, nm);
+                env->DeleteLocalRef(nm);
+                if (!h || env->ExceptionCheck()) {
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    return nullptr;
+                }
+                jclass hc = env->GetObjectClass(h);
+                jfieldID f = findFieldByDesc(hc, "Lnet/minecraft/network/ProtocolInfo;", false);
+                jobject pi = f ? env->GetObjectField(h, f) : nullptr;
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                env->DeleteLocalRef(hc);
+                env->DeleteLocalRef(h);
+                return pi;
+            };
+
+            jobject cb = steal("encoder");
+            if (cb) {
+                if (g_bs.piPlayCbound) env->DeleteGlobalRef(g_bs.piPlayCbound);
+                g_bs.piPlayCbound = env->NewGlobalRef(cb);
+                env->DeleteLocalRef(cb);
+            }
+            jobject sb = steal("decoder");
+            if (sb) {
+                if (g_bs.piPlaySbound) env->DeleteGlobalRef(g_bs.piPlaySbound);
+                g_bs.piPlaySbound = env->NewGlobalRef(sb);
+                env->DeleteLocalRef(sb);
+            }
+            env->DeleteLocalRef(aPipeline);
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
+
+    if (g_bs.piPlayCbound && g_bs.piPlaySbound)
+        LogTo("play-proto: lifted A's PLAY ProtocolInfo (encoder+decoder) — "
+              "registries come from A");
+    else
+        LogTo("play-proto: WARNING could not lift A's ProtocolInfo; falling back "
+              "to template-bound ones, registry-carrying packets may fail");
+    g_bs.playProtocolReady = true;
+}
+
+void setProtocolState(JNIEnv* env, jobject channel, ProtoState st) {
+    if (!channel || !g_bs.channelPipelineMid || !g_bs.pipelineReplaceMid) return;
 
     jobject pipeline = env->CallObjectMethod(channel, g_bs.channelPipelineMid);
     if (!pipeline || env->ExceptionCheck()) { env->ExceptionClear(); return; }
 
-    for (const char* handlerName : {"encoder", "decoder"}) {
-        jstring nm = env->NewStringUTF(handlerName);
-        jobject handler = env->CallObjectMethod(pipeline, g_bs.pipelineGetHandlerMid, nm);
-        env->DeleteLocalRef(nm);
-        if (!handler || env->ExceptionCheck()) { env->ExceptionClear(); continue; }
-        jclass hCls = env->GetObjectClass(handler);
+    static const char* kOutboundNames[] = {"encoder", "outbound_config"};
+    static const char* kInboundNames[]  = {"decoder", "inbound_config"};
 
-        jmethodID sp = findMethodByDesc(hCls,
-            "(Lnet/minecraft/network/ConnectionProtocol;)V", false);
-        if (!sp) {
-            sp = env->GetMethodID(hCls, "setProtocol",
-                "(Lnet/minecraft/network/ConnectionProtocol;)V");
-            if (env->ExceptionCheck()) env->ExceptionClear();
-        }
-        if (sp) {
-            env->CallVoidMethod(handler, sp, protoValue);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            else LogTo("setProtocolState: called %s.setProtocol(PLAY)", handlerName);
-        }
-        env->DeleteLocalRef(hCls);
-        env->DeleteLocalRef(handler);
-    }
+    swapPipelineHandler(env, pipeline, "encoder", kOutboundNames, 2,
+                        g_bs.packetEncoderCls, g_bs.packetEncoderCtor,
+                        protocolInfoFor(st, true), "outbound");
+    swapPipelineHandler(env, pipeline, "decoder", kInboundNames, 2,
+                        g_bs.packetDecoderCls, g_bs.packetDecoderCtor,
+                        protocolInfoFor(st, false), "inbound");
+
     env->DeleteLocalRef(pipeline);
 }
 
@@ -422,25 +702,17 @@ void JNICALL Native_ServerInit_initChannel(JNIEnv* env, jobject , jobject ch) {
         env->ExceptionClear(); LogTo("  pipeline() failed"); return;
     }
 
-    setProtocolState(env, ch, g_bs.protoHandshaking);
-
+    // 1.21.8: configureSerialization grew a `local` flag and a bandwidth
+    // monitor.  We are a real socket server, so local=false and no monitor.
     env->CallStaticVoidMethod(g_bs.connectionCls, g_bs.connectionConfigureSerMid,
-                              pipeline, g_bs.flowServerbound);
+                              pipeline, g_bs.flowServerbound, (jboolean)JNI_FALSE,
+                              (jobject)nullptr);
     if (env->ExceptionCheck()) { LogAndClearException(env, "  configureSerialization"); }
 
-    bool haveBundlerInfo = (g_bs.bundlerProviderFid != nullptr &&
-                            g_bs.bundlerInfoCls   != nullptr);
-    if (!haveBundlerInfo) {
-        for (const char* h : {"unbundler", "bundler"}) {
-            jstring nm = env->NewStringUTF(h);
-            env->CallObjectMethod(pipeline, g_bs.pipelineRemoveNameMid, nm);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            env->DeleteLocalRef(nm);
-        }
-        LogTo("  bundle handlers removed (no BundlerInfo)");
-    } else {
-        LogTo("  bundle handlers kept (BundlerInfo available)");
-    }
+    // configureSerialization installs the serverbound decoder for real and
+    // leaves the outbound side as an UnconfiguredPipelineHandler placeholder;
+    // setProtocolState swaps both for the handshake protocol below.
+    setProtocolState(env, ch, ProtoState::Handshake);
 
     jobject handler = env->NewObject(g_bs.handlerClass, g_bs.handlerCtor);
     jstring name = env->NewStringUTF("bside");
@@ -640,48 +912,107 @@ bool defineMainGateClass(JNIEnv* env, jobject mcLoader) {
     return true;
 }
 
+jboolean JNICALL Native_GameContext_hasInfiniteMaterials(JNIEnv*, jobject) {
+    // Only the clientbound codecs consult this, to decide whether item stacks
+    // carry the "infinite materials" component set.  We encode serverbound-side
+    // packets and re-encode packets A already decoded, so the plain setting is
+    // what we want.
+    return JNI_FALSE;
+}
+
+// GameProtocols.SERVERBOUND_TEMPLATE is an UnboundProtocol, so binding it needs
+// a GameProtocols$Context instance.  That interface has exactly one method, so
+// we synthesise an implementation at runtime the same way HookBridge and the
+// relay handler are synthesised.
+bool defineGameContextClass(JNIEnv* env, jobject mcLoader) {
+    if (g_bs.gameContextCls && g_bs.gameContextCtor) return true;
+
+    std::string simple   = GenerateRandomClassName(2, 3);
+    std::string internal = MakeInternalName(GetTrampolinePackage(), simple);
+
+    ClassBuilder cb(internal, "java/lang/Object", 52);
+    cb.addInterface("net/minecraft/network/protocol/game/GameProtocols$Context");
+
+    u2 objInit = cb.methodRef("java/lang/Object", "<init>", "()V");
+    std::vector<u1> ctor = {
+        0x2A,
+        0xB7, u1((objInit >> 8) & 0xFF), u1(objInit & 0xFF),
+        0xB1,
+    };
+    cb.addCodedMethod("<init>", "()V", ACC_PUBLIC, ctor, 1, 1);
+    cb.addNativeMethod("hasInfiniteMaterials", "()Z", ACC_PUBLIC | ACC_NATIVE);
+
+    std::vector<u1> bytes = cb.build();
+    jclass defined = env->DefineClass(internal.c_str(), mcLoader,
+                                      reinterpret_cast<const jbyte*>(bytes.data()),
+                                      static_cast<jsize>(bytes.size()));
+    if (!defined) {
+        LogAndClearException(env, "BServer/DefineGameContext");
+        return false;
+    }
+
+    JNINativeMethod nats[] = {
+        {const_cast<char*>("hasInfiniteMaterials"), const_cast<char*>("()Z"),
+         reinterpret_cast<void*>(&Native_GameContext_hasInfiniteMaterials)},
+    };
+    if (env->RegisterNatives(defined, nats, 1) != 0) {
+        LogAndClearException(env, "BServer/RegisterGameContext");
+        env->DeleteLocalRef(defined);
+        return false;
+    }
+
+    g_bs.gameContextCtor = env->GetMethodID(defined, "<init>", "()V");
+    if (!g_bs.gameContextCtor) {
+        LogAndClearException(env, "BServer/GameContextCtor");
+        env->DeleteLocalRef(defined);
+        return false;
+    }
+    g_bs.gameContextCls = static_cast<jclass>(env->NewGlobalRef(defined));
+    env->DeleteLocalRef(defined);
+    LogTo("BServer: defined GameProtocols$Context impl as %s", internal.c_str());
+    return true;
+}
+
 bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
 
     jclass connCls = loadOrFind(env, mcLoader,
         "net.minecraft.network.Connection", "Lnet/minecraft/network/Connection;");
     if (!connCls) return false;
     g_bs.connectionCls = static_cast<jclass>(env->NewGlobalRef(connCls));
+    // 1.21.8: configureSerialization(ChannelPipeline, PacketFlow, boolean, BandwidthDebugMonitor)
     g_bs.connectionConfigureSerMid = findMethodByDesc(connCls,
-        "(Lio/netty/channel/ChannelPipeline;Lnet/minecraft/network/protocol/PacketFlow;)V", true);
+        "(Lio/netty/channel/ChannelPipeline;Lnet/minecraft/network/protocol/PacketFlow;Z"
+        "Lnet/minecraft/network/BandwidthDebugMonitor;)V", true);
+    if (!g_bs.connectionConfigureSerMid) {
+        // pre-1.20.5 shape, kept as a probe so the log tells us which we hit
+        g_bs.connectionConfigureSerMid = findMethodByDesc(connCls,
+            "(Lio/netty/channel/ChannelPipeline;Lnet/minecraft/network/protocol/PacketFlow;)V", true);
+    }
     g_bs.connectionSendMid = findMethodByDesc(connCls,
         "(Lnet/minecraft/network/protocol/Packet;)V", false);
-    g_bs.connectionAttrProtocolFid = findFieldByDesc(connCls,
-        "Lio/netty/util/AttributeKey;", true);
 
     g_bs.connectionChannelFid = findFieldByDesc(connCls,
         "Lio/netty/channel/Channel;", false);
     env->DeleteLocalRef(connCls);
 
-    jclass bundlerCls = loadOrFind(env, mcLoader,
-        "net.minecraft.network.protocol.BundlerInfo", "Lnet/minecraft/network/protocol/BundlerInfo;");
-    if (bundlerCls) {
-        g_bs.bundlerInfoCls = static_cast<jclass>(env->NewGlobalRef(bundlerCls));
-        g_bs.bundlerProviderFid = findFieldByDesc(bundlerCls, "Lio/netty/util/AttributeKey;", true);
-        env->DeleteLocalRef(bundlerCls);
-    } else {
-        LogTo("BServer: BundlerInfo not found (bundle attr not set — may cause issues on modern servers)");
-    }
-
-    jclass protoCls = loadOrFind(env, mcLoader,
-        "net.minecraft.network.ConnectionProtocol", "Lnet/minecraft/network/ConnectionProtocol;");
-    if (protoCls) {
-        auto readEnum = [&](const char* n) -> jobject {
-            jfieldID f = env->GetStaticFieldID(protoCls, n, "Lnet/minecraft/network/ConnectionProtocol;");
+    jclass intentCls = loadOrFind(env, mcLoader,
+        "net.minecraft.network.protocol.handshake.ClientIntent",
+        "Lnet/minecraft/network/protocol/handshake/ClientIntent;");
+    if (intentCls) {
+        g_bs.clientIntentCls = static_cast<jclass>(env->NewGlobalRef(intentCls));
+        auto readIntent = [&](const char* n) -> jobject {
+            jfieldID f = env->GetStaticFieldID(intentCls, n,
+                "Lnet/minecraft/network/protocol/handshake/ClientIntent;");
             if (!f) return nullptr;
-            jobject v = env->GetStaticObjectField(protoCls, f);
+            jobject v = env->GetStaticObjectField(intentCls, f);
             return v ? env->NewGlobalRef(v) : nullptr;
         };
-        g_bs.protoHandshaking = readEnum("HANDSHAKING");
-        g_bs.protoLogin       = readEnum("LOGIN");
-        g_bs.protoPlay        = readEnum("PLAY");
-        g_bs.protoStatus      = readEnum("STATUS");
+        g_bs.intentLogin  = readIntent("LOGIN");
+        g_bs.intentStatus = readIntent("STATUS");
         if (env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(protoCls);
+        env->DeleteLocalRef(intentCls);
+    } else {
+        LogTo("BServer: ClientIntent not found — handshake intention won't be understood");
     }
 
     jclass flowCls = loadOrFind(env, mcLoader,
@@ -744,13 +1075,102 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         "(Ljava/lang/String;)Lio/netty/channel/ChannelHandler;");
     g_bs.pipelineGetHandlerMid = env->GetMethodID(pipCls, "get",
         "(Ljava/lang/String;)Lio/netty/channel/ChannelHandler;");
+    g_bs.pipelineReplaceMid = env->GetMethodID(pipCls, "replace",
+        "(Ljava/lang/String;Ljava/lang/String;Lio/netty/channel/ChannelHandler;)"
+        "Lio/netty/channel/ChannelHandler;");
+    if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(pipCls);
 
-    jclass attrCls = loadOrFind(env, mcLoader, "io.netty.util.Attribute", "Lio/netty/util/Attribute;");
-    if (!attrCls) return false;
-    g_bs.attributeCls = static_cast<jclass>(env->NewGlobalRef(attrCls));
-    g_bs.attributeSetMid = env->GetMethodID(attrCls, "set", "(Ljava/lang/Object;)V");
-    env->DeleteLocalRef(attrCls);
+    // --- 1.21.8 protocol plumbing ------------------------------------------
+    jclass rfbCls = loadOrFind(env, mcLoader,
+        "net.minecraft.network.RegistryFriendlyByteBuf",
+        "Lnet/minecraft/network/RegistryFriendlyByteBuf;");
+    if (rfbCls) {
+        g_bs.registryBufCls = static_cast<jclass>(env->NewGlobalRef(rfbCls));
+        g_bs.registryBufCtor = env->GetMethodID(rfbCls, "<init>",
+            "(Lio/netty/buffer/ByteBuf;Lnet/minecraft/core/RegistryAccess;)V");
+        g_bs.rfbDecoratorMid = env->GetStaticMethodID(rfbCls, "decorator",
+            "(Lnet/minecraft/core/RegistryAccess;)Ljava/util/function/Function;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(rfbCls);
+    }
+    jclass raCls = loadOrFind(env, mcLoader, "net.minecraft.core.RegistryAccess",
+                              "Lnet/minecraft/core/RegistryAccess;");
+    if (raCls) {
+        g_bs.registryAccessCls = static_cast<jclass>(env->NewGlobalRef(raCls));
+        g_bs.registryAccessEmptyFid = env->GetStaticFieldID(raCls, "EMPTY",
+            "Lnet/minecraft/core/RegistryAccess$Frozen;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(raCls);
+    }
+
+    g_bs.protocolInfoCls = static_cast<jclass>(loadOrFind(env, mcLoader,
+        "net.minecraft.network.ProtocolInfo", "Lnet/minecraft/network/ProtocolInfo;"));
+    jclass encCls = loadOrFind(env, mcLoader, "net.minecraft.network.PacketEncoder",
+                               "Lnet/minecraft/network/PacketEncoder;");
+    if (encCls) {
+        g_bs.packetEncoderCls = static_cast<jclass>(env->NewGlobalRef(encCls));
+        g_bs.packetEncoderCtor = env->GetMethodID(encCls, "<init>",
+            "(Lnet/minecraft/network/ProtocolInfo;)V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(encCls);
+    }
+    jclass decCls = loadOrFind(env, mcLoader, "net.minecraft.network.PacketDecoder",
+                               "Lnet/minecraft/network/PacketDecoder;");
+    if (decCls) {
+        g_bs.packetDecoderCls = static_cast<jclass>(env->NewGlobalRef(decCls));
+        g_bs.packetDecoderCtor = env->GetMethodID(decCls, "<init>",
+            "(Lnet/minecraft/network/ProtocolInfo;)V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(decCls);
+    }
+    {
+        jclass subCls = loadOrFind(env, mcLoader,
+            "net.minecraft.network.protocol.SimpleUnboundProtocol",
+            "Lnet/minecraft/network/protocol/SimpleUnboundProtocol;");
+        if (subCls) {
+            g_bs.simpleUnboundBindMid = env->GetMethodID(subCls, "bind",
+                "(Ljava/util/function/Function;)Lnet/minecraft/network/ProtocolInfo;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(subCls);
+        }
+        jclass ubCls = loadOrFind(env, mcLoader, "net.minecraft.network.protocol.UnboundProtocol",
+                                  "Lnet/minecraft/network/protocol/UnboundProtocol;");
+        if (ubCls) {
+            g_bs.unboundBindMid = env->GetMethodID(ubCls, "bind",
+                "(Ljava/util/function/Function;Ljava/lang/Object;)"
+                "Lnet/minecraft/network/ProtocolInfo;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(ubCls);
+        }
+    }
+
+    g_bs.piHandshakeSbound = bindProtocolInfoField(env,
+        "net.minecraft.network.protocol.handshake.HandshakeProtocols", "SERVERBOUND");
+    g_bs.piLoginCbound = bindProtocolInfoField(env,
+        "net.minecraft.network.protocol.login.LoginProtocols", "CLIENTBOUND");
+    g_bs.piLoginSbound = bindProtocolInfoField(env,
+        "net.minecraft.network.protocol.login.LoginProtocols", "SERVERBOUND");
+    g_bs.piConfigCbound = bindProtocolInfoField(env,
+        "net.minecraft.network.protocol.configuration.ConfigurationProtocols", "CLIENTBOUND");
+    g_bs.piConfigSbound = bindProtocolInfoField(env,
+        "net.minecraft.network.protocol.configuration.ConfigurationProtocols", "SERVERBOUND");
+    g_bs.piStatusCbound = bindProtocolInfoField(env,
+        "net.minecraft.network.protocol.status.StatusProtocols", "CLIENTBOUND");
+    g_bs.piStatusSbound = bindProtocolInfoField(env,
+        "net.minecraft.network.protocol.status.StatusProtocols", "SERVERBOUND");
+    g_bs.piPlayCbound = bindProtocolTemplate(env,
+        "net.minecraft.network.protocol.game.GameProtocols", "CLIENTBOUND_TEMPLATE", false);
+    g_bs.piPlaySbound = bindProtocolTemplate(env,
+        "net.minecraft.network.protocol.game.GameProtocols", "SERVERBOUND_TEMPLATE", true);
+
+    LogTo("proto refs: enc=%p dec=%p replace=%p bind=%p/%p playCB=%p playSB=%p "
+          "loginCB=%p loginSB=%p cfgCB=%p cfgSB=%p hsSB=%p",
+          (void*)g_bs.packetEncoderCtor, (void*)g_bs.packetDecoderCtor,
+          (void*)g_bs.pipelineReplaceMid, (void*)g_bs.simpleUnboundBindMid,
+          (void*)g_bs.unboundBindMid, (void*)g_bs.piPlayCbound, (void*)g_bs.piPlaySbound,
+          (void*)g_bs.piLoginCbound, (void*)g_bs.piLoginSbound,
+          (void*)g_bs.piConfigCbound, (void*)g_bs.piConfigSbound, (void*)g_bs.piHandshakeSbound);
 
     jclass gpCls = loadOrFind(env, mcLoader, "com.mojang.authlib.GameProfile",
                               "Lcom/mojang/authlib/GameProfile;");
@@ -789,7 +1209,6 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
                                "Lnet/minecraft/network/FriendlyByteBuf;");
     if (fbbCls) {
         g_bs.friendlyBufCls = static_cast<jclass>(env->NewGlobalRef(fbbCls));
-        g_bs.friendlyBufCtor = env->GetMethodID(fbbCls, "<init>", "(Lio/netty/buffer/ByteBuf;)V");
 
         g_bs.fbbWriteByteMid    = env->GetMethodID(fbbCls, "writeByte",    "(I)Lio/netty/buffer/ByteBuf;");
         g_bs.fbbWriteBooleanMid = env->GetMethodID(fbbCls, "writeBoolean", "(Z)Lio/netty/buffer/ByteBuf;");
@@ -828,10 +1247,10 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     if (piuCls) {
         g_bs.playerInfoUpdatePacketCls = static_cast<jclass>(env->NewGlobalRef(piuCls));
         g_bs.playerInfoUpdatePacketBufCtor = env->GetMethodID(piuCls, "<init>",
-            "(Lnet/minecraft/network/FriendlyByteBuf;)V");
+            "(Lnet/minecraft/network/RegistryFriendlyByteBuf;)V");
 
         g_bs.playerInfoUpdatePacketWriteMid = findMethodByDesc(piuCls,
-            "(Lnet/minecraft/network/FriendlyByteBuf;)V", false);
+            "(Lnet/minecraft/network/RegistryFriendlyByteBuf;)V", false);
 
         jmethodID listMids[2] = {nullptr, nullptr};
         int nList = findMethodsByDesc(piuCls, "()Ljava/util/List;", false, listMids, 2);
@@ -891,18 +1310,21 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         }
     }
 
+    // 1.21.8 removed ClientboundAddPlayerPacket; players now arrive through
+    // ClientboundAddEntityPacket, which carries the same UUID field.  Its
+    // EntityType field distinguishes players, but the UUID is all we need.
     jclass appCls = loadOrFind(env, mcLoader,
-        "net.minecraft.network.protocol.game.ClientboundAddPlayerPacket",
-        "Lnet/minecraft/network/protocol/game/ClientboundAddPlayerPacket;");
+        "net.minecraft.network.protocol.game.ClientboundAddEntityPacket",
+        "Lnet/minecraft/network/protocol/game/ClientboundAddEntityPacket;");
     if (appCls) {
-        g_bs.addPlayerPacketCls = static_cast<jclass>(env->NewGlobalRef(appCls));
-        g_bs.addPlayerPacketUuidFid = findFieldByDesc(appCls, "Ljava/util/UUID;", false);
+        g_bs.addEntityPacketCls = static_cast<jclass>(env->NewGlobalRef(appCls));
+        g_bs.addEntityPacketUuidFid = findFieldByDesc(appCls, "Ljava/util/UUID;", false);
         env->DeleteLocalRef(appCls);
     }
 
     jclass cpp = loadOrFind(env, mcLoader,
-        "net.minecraft.network.protocol.game.ClientboundCustomPayloadPacket",
-        "Lnet/minecraft/network/protocol/game/ClientboundCustomPayloadPacket;");
+        "net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket",
+        "Lnet/minecraft/network/protocol/common/ClientboundCustomPayloadPacket;");
     if (cpp) {
         g_bs.customPayloadPacketCls = static_cast<jclass>(env->NewGlobalRef(cpp));
         env->DeleteLocalRef(cpp);
@@ -914,7 +1336,7 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     if (sptCls) {
         g_bs.setPlayerTeamPacketCls = static_cast<jclass>(env->NewGlobalRef(sptCls));
         g_bs.setPlayerTeamPacketBufCtor = env->GetMethodID(sptCls, "<init>",
-            "(Lnet/minecraft/network/FriendlyByteBuf;)V");
+            "(Lnet/minecraft/network/RegistryFriendlyByteBuf;)V");
         g_bs.setPlayerTeamMethodFid  = findFieldByDesc(sptCls, "I", false);
         g_bs.setPlayerTeamNameFid    = findFieldByDesc(sptCls, "Ljava/lang/String;", false);
         g_bs.setPlayerTeamPlayersFid = findFieldByDesc(sptCls, "Ljava/util/Collection;", false);
@@ -937,15 +1359,29 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
 
+    // 1.20.2 renamed ClientboundGameProfilePacket -> ClientboundLoginFinishedPacket
     jclass lfp = loadOrFind(env, mcLoader,
-        "net.minecraft.network.protocol.login.ClientboundGameProfilePacket",
-        "Lnet/minecraft/network/protocol/login/ClientboundGameProfilePacket;");
+        "net.minecraft.network.protocol.login.ClientboundLoginFinishedPacket",
+        "Lnet/minecraft/network/protocol/login/ClientboundLoginFinishedPacket;");
     if (lfp) {
         g_bs.loginFinishedPacketCls = static_cast<jclass>(env->NewGlobalRef(lfp));
 
         g_bs.loginFinishedPacketCtor = findMethodByDesc(lfp,
             "(Lcom/mojang/authlib/GameProfile;)V", false);
         env->DeleteLocalRef(lfp);
+    }
+
+    // The configuration phase (new in 1.20.2) is ended by this packet.  B is
+    // held in CONFIGURATION until A's own configuration stream has been
+    // mirrored across, so this lookup is what ultimately releases B into PLAY.
+    jclass fcp = loadOrFind(env, mcLoader,
+        "net.minecraft.network.protocol.configuration.ClientboundFinishConfigurationPacket",
+        "Lnet/minecraft/network/protocol/configuration/ClientboundFinishConfigurationPacket;");
+    if (fcp) {
+        g_bs.finishConfigPacketCls = static_cast<jclass>(env->NewGlobalRef(fcp));
+        g_bs.finishConfigPacketCtor = env->GetMethodID(fcp, "<init>", "()V");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(fcp);
     }
 
     jclass hello = loadOrFind(env, mcLoader,
@@ -963,7 +1399,7 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     if (intent) {
         g_bs.intentPacketCls = static_cast<jclass>(env->NewGlobalRef(intent));
         g_bs.intentionPacketIntentFid = findFieldByDesc(intent,
-            "Lnet/minecraft/network/ConnectionProtocol;", false);
+            "Lnet/minecraft/network/protocol/handshake/ClientIntent;", false);
         env->DeleteLocalRef(intent);
     }
 
@@ -972,9 +1408,10 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         "Lnet/minecraft/network/protocol/status/ServerboundStatusRequestPacket;");
     if (sReq) { g_bs.statusRequestPacketCls = static_cast<jclass>(env->NewGlobalRef(sReq)); env->DeleteLocalRef(sReq); }
 
+    // the status ping packets moved to their own `ping` package in 1.20.2+
     jclass pReq = loadOrFind(env, mcLoader,
-        "net.minecraft.network.protocol.status.ServerboundPingRequestPacket",
-        "Lnet/minecraft/network/protocol/status/ServerboundPingRequestPacket;");
+        "net.minecraft.network.protocol.ping.ServerboundPingRequestPacket",
+        "Lnet/minecraft/network/protocol/ping/ServerboundPingRequestPacket;");
     if (pReq) {
         g_bs.pingRequestPacketCls = static_cast<jclass>(env->NewGlobalRef(pReq));
         g_bs.pingRequestPacketTimeFid = findFieldByDesc(pReq, "J", false);
@@ -982,8 +1419,8 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     }
 
     jclass pong = loadOrFind(env, mcLoader,
-        "net.minecraft.network.protocol.status.ClientboundPongResponsePacket",
-        "Lnet/minecraft/network/protocol/status/ClientboundPongResponsePacket;");
+        "net.minecraft.network.protocol.ping.ClientboundPongResponsePacket",
+        "Lnet/minecraft/network/protocol/ping/ClientboundPongResponsePacket;");
     if (pong) {
         g_bs.pongResponsePacketCls = static_cast<jclass>(env->NewGlobalRef(pong));
         g_bs.pongResponsePacketCtor = findMethodByDesc(pong, "(J)V", false);
@@ -1014,8 +1451,13 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         "Lnet/minecraft/network/protocol/game/ClientboundPlayerPositionPacket;");
     if (pp) {
         g_bs.playerPositionPacketCls = static_cast<jclass>(env->NewGlobalRef(pp));
+        // 1.21.2 replaced the (x, y, z, yRot, xRot, relatives, id) constructor
+        // with (id, PositionMoveRotation, relatives).  Only the placeholder
+        // spawn in reconstructAndSendLoginToB uses this, and that whole path is
+        // gated behind kGiveBOwnIdentity, so we resolve the new shape and leave
+        // the (still 1.20.1-shaped) call site disabled.
         g_bs.playerPositionPacketCtor = findMethodByDesc(pp,
-            "(DDDFFLjava/util/Set;I)V", false);
+            "(ILnet/minecraft/world/entity/PositionMoveRotation;Ljava/util/Set;)V", false);
         env->DeleteLocalRef(pp);
     }
 
@@ -1027,8 +1469,8 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     }
 
     jclass kap = loadOrFind(env, mcLoader,
-        "net.minecraft.network.protocol.game.ClientboundKeepAlivePacket",
-        "Lnet/minecraft/network/protocol/game/ClientboundKeepAlivePacket;");
+        "net.minecraft.network.protocol.common.ClientboundKeepAlivePacket",
+        "Lnet/minecraft/network/protocol/common/ClientboundKeepAlivePacket;");
     if (kap) {
         g_bs.keepAlivePacketCls = static_cast<jclass>(env->NewGlobalRef(kap));
         g_bs.keepAlivePacketCtor = findMethodByDesc(kap, "(J)V", false);
@@ -1072,16 +1514,17 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         env->DeleteLocalRef(uuidCls);
     }
 
-    LogTo("cacheJavaRefs: configureSer=%p send=%p attrProtoFid=%p bundlerFid=%p "
-          "protoHS=%p protoLOGIN=%p protoPLAY=%p flowSB=%p pipMid=%p addLast=%p "
-          "attrSet=%p gpCtor=%p lfpCtor=%p helloName=%p uuidFromBytes=%p",
+    LogTo("cacheJavaRefs: configureSer=%p send=%p flowSB=%p pipMid=%p addLast=%p "
+          "replace=%p gpCtor=%p lfpCtor=%p finishCfg=%p helloName=%p uuidFromBytes=%p "
+          "intentFid=%p pingTimeFid=%p intentClasses=%p/%p",
           (void*)g_bs.connectionConfigureSerMid, (void*)g_bs.connectionSendMid,
-          (void*)g_bs.connectionAttrProtocolFid, (void*)g_bs.bundlerProviderFid,
-          (void*)g_bs.protoHandshaking, (void*)g_bs.protoLogin, (void*)g_bs.protoPlay,
           (void*)g_bs.flowServerbound, (void*)g_bs.channelPipelineMid,
-          (void*)g_bs.pipelineAddLastMid, (void*)g_bs.attributeSetMid,
+          (void*)g_bs.pipelineAddLastMid, (void*)g_bs.pipelineReplaceMid,
           (void*)g_bs.gameProfileCtor, (void*)g_bs.loginFinishedPacketCtor,
-          (void*)g_bs.helloPacketNameFid, (void*)g_bs.uuidNameUuidFromBytesMid);
+          (void*)g_bs.finishConfigPacketCtor,
+          (void*)g_bs.helloPacketNameFid, (void*)g_bs.uuidNameUuidFromBytesMid,
+          (void*)g_bs.intentionPacketIntentFid, (void*)g_bs.pingRequestPacketTimeFid,
+          (void*)g_bs.intentLogin, (void*)g_bs.intentStatus);
     if (env->ExceptionCheck()) env->ExceptionClear();
 
     if (g_bs.minecraftCls) {
@@ -1106,13 +1549,15 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
         if (env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(cplCls);
     }
-    jclass raCls = loadOrFind(env, mcLoader, "net.minecraft.core.RegistryAccess",
-                              "Lnet/minecraft/core/RegistryAccess;");
-    if (raCls) {
-        g_bs.registryAccessFreezeMid = findMethodByDesc(raCls,
-            "()Lnet/minecraft/core/RegistryAccess$Frozen;", false);
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        env->DeleteLocalRef(raCls);
+    {
+        jclass frozenCls = loadOrFind(env, mcLoader, "net.minecraft.core.RegistryAccess",
+                                      "Lnet/minecraft/core/RegistryAccess;");
+        if (frozenCls) {
+            g_bs.registryAccessFreezeMid = findMethodByDesc(frozenCls,
+                "()Lnet/minecraft/core/RegistryAccess$Frozen;", false);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->DeleteLocalRef(frozenCls);
+        }
     }
     jclass mpgmCls = loadOrFind(env, mcLoader,
         "net.minecraft.client.multiplayer.MultiPlayerGameMode",
@@ -1156,19 +1601,25 @@ bool cacheJavaRefs(JNIEnv* env, jobject mcLoader) {
     if (loginCls) {
         g_bs.loginPacketCls = static_cast<jclass>(env->NewGlobalRef(loginCls));
 
+        // 1.21.8 reshaped this packet around CommonPlayerSpawnInfo:
+        //   (IZLjava/util/Set;IIIZZZLCommonPlayerSpawnInfo;Z)V
+        // We do not synthesise it -- A's own ClientboundLoginPacket is mirrored
+        // through to B instead -- so we only record whether it is reachable, to
+        // decide later whether the synthetic path is even available.
         g_bs.loginPacketCtor = env->GetMethodID(loginCls, "<init>",
-            "(IZLnet/minecraft/world/level/GameType;Lnet/minecraft/world/level/GameType;"
-            "Ljava/util/Set;Lnet/minecraft/core/RegistryAccess$Frozen;"
-            "Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/ResourceKey;"
-            "JIIIZZZZLjava/util/Optional;I)V");
+            "(IZLjava/util/Set;IIIZZZ"
+            "Lnet/minecraft/network/protocol/game/CommonPlayerSpawnInfo;Z)V");
         if (env->ExceptionCheck()) env->ExceptionClear();
-        LogTo("  login ctor %s", g_bs.loginPacketCtor ? "resolved" : "MISSING");
+        LogTo("  login ctor %s (unused: B mirrors A's own login packet)",
+              g_bs.loginPacketCtor ? "resolved" : "MISSING");
         env->DeleteLocalRef(loginCls);
     }
 
     return g_bs.connectionConfigureSerMid && g_bs.connectionSendMid &&
            g_bs.flowServerbound && g_bs.channelPipelineMid && g_bs.pipelineAddLastMid &&
-           g_bs.channelWriteAndFlushMid && g_bs.channelAttrMid && g_bs.attributeSetMid;
+           g_bs.channelWriteAndFlushMid && g_bs.pipelineReplaceMid &&
+           g_bs.packetEncoderCtor && g_bs.packetDecoderCtor &&
+           g_bs.piPlayCbound && g_bs.piPlaySbound;
 }
 
 bool bindServer(JNIEnv* env, jobject mcLoader) {
@@ -1231,7 +1682,10 @@ bool InstallBServer(JNIEnv* env) {
     if (g_bs.bServerBound) return true;
     jobject mcLoader = GetMinecraftClassLoader(env, g_jvmti);
     if (!mcLoader) return false;
+    // defineGameContextClass must precede cacheJavaRefs: binding the PLAY
+    // ProtocolInfo needs an instance of it.
     bool ok = defineInitClass(env, mcLoader) && defineHandlerClass(env, mcLoader)
+           && defineGameContextClass(env, mcLoader)
            && cacheJavaRefs(env, mcLoader) && bindServer(env, mcLoader);
     env->DeleteGlobalRef(mcLoader);
     if (ok) g_bs.bServerBound = true;
@@ -1242,14 +1696,19 @@ bool BServer_IsBActive() {
     return g_bs.bState.load(std::memory_order_acquire) == BState::Play;
 }
 
+bool BServer_ShouldMirror() {
+    BState s = g_bs.bState.load(std::memory_order_acquire);
+    return s == BState::Play || s == BState::AwaitConfiguration;
+}
+
 bool BServer_IsLoginIntention(JNIEnv* env, jobject packet) {
     if (!env || !packet) return false;
     if (!g_bs.intentPacketCls || !env->IsInstanceOf(packet, g_bs.intentPacketCls))
         return false;
-    if (!g_bs.intentionPacketIntentFid || !g_bs.protoLogin) return false;
+    if (!g_bs.intentionPacketIntentFid || !g_bs.intentLogin) return false;
     jobject intent = env->GetObjectField(packet, g_bs.intentionPacketIntentFid);
     if (!intent) return false;
-    bool isLogin = env->IsSameObject(intent, g_bs.protoLogin);
+    bool isLogin = env->IsSameObject(intent, g_bs.intentLogin);
     env->DeleteLocalRef(intent);
     return isLogin;
 }
@@ -1455,7 +1914,7 @@ void ensureARealUuid(JNIEnv* env) {
 
 void sendSelfInfoToB(JNIEnv* env, jobject offlineUuid, jstring name) {
     if (!g_bs.minecraftCls || !g_bs.mcGetInstanceMid || !g_bs.mcGetProfilePropsMid ||
-        !g_bs.friendlyBufCls || !g_bs.friendlyBufCtor || !g_bs.fbbWriteByteMid ||
+        !g_bs.registryBufCls || !g_bs.registryBufCtor || !g_bs.fbbWriteByteMid ||
         !g_bs.fbbWriteBooleanMid || !g_bs.fbbWriteVarIntMid ||
         !g_bs.fbbWriteUUIDMid || !g_bs.fbbWriteUtfMid || !g_bs.fbbWriteGpPropsMid ||
         !g_bs.unpooledCls || !g_bs.unpooledBufferMid ||
@@ -1469,11 +1928,8 @@ void sendSelfInfoToB(JNIEnv* env, jobject offlineUuid, jstring name) {
     env->DeleteLocalRef(mc);
     if (!props || env->ExceptionCheck()) { env->ExceptionClear(); LogTo("self-info: no profile props"); return; }
 
-    jobject bb = env->CallStaticObjectMethod(g_bs.unpooledCls, g_bs.unpooledBufferMid);
-    if (!bb || env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(props); return; }
-    jobject buf = env->NewObject(g_bs.friendlyBufCls, g_bs.friendlyBufCtor, bb);
-    env->DeleteLocalRef(bb);
-    if (!buf || env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(props); return; }
+    jobject buf = newWriteBuf(env);
+    if (!buf) { env->DeleteLocalRef(props); return; }
 
     env->CallObjectMethod(buf, g_bs.fbbWriteByteMid, (jint)0x1D);
     env->CallObjectMethod(buf, g_bs.fbbWriteByteMid, (jint)0x01);
@@ -1603,7 +2059,11 @@ bool reconstructAndSendLoginToB(JNIEnv* env, jobject ch) {
     if (!sent) return false;
     LogTo("mid-login: rebuilt ClientboundLoginPacket sent to B");
 
-    if (g_bs.playerPositionPacketCtor && g_bs.setOfMid && g_bs.setCls) {
+    // Disabled with the rest of the identity-rewriting path.  The argument list
+    // below is still 1.20.1's (x, y, z, yRot, xRot, relatives, id); 1.21.8 wants
+    // (id, PositionMoveRotation, relatives), so this needs rewriting before
+    // kGiveBOwnIdentity can be turned on.
+    if (kGiveBOwnIdentity && g_bs.playerPositionPacketCtor && g_bs.setOfMid && g_bs.setCls) {
         jobject relSet = env->CallStaticObjectMethod(g_bs.setCls, g_bs.setOfMid);
         if (relSet && !env->ExceptionCheck()) {
             jobject pos = env->NewObject(g_bs.playerPositionPacketCls, g_bs.playerPositionPacketCtor,
@@ -1656,28 +2116,37 @@ void completeLogin(JNIEnv* env, jobject hello) {
 
     writeToB(env, lfp);
     env->DeleteLocalRef(lfp);
-    LogTo("login: sent ClientboundGameProfilePacket to B");
+    LogTo("login: sent ClientboundLoginFinishedPacket to B");
 
+    // 1.20.2 inserted a whole CONFIGURATION phase between LOGIN and PLAY: the
+    // server must send the registry contents, enabled features, tags and known
+    // packs, and only ClientboundFinishConfigurationPacket moves the client on.
+    // Rather than synthesise a registry from scratch, we hold B here and let
+    // A's own configuration stream through (see BServer_ForwardToB) -- B then
+    // ends up with exactly A's registries, which is what makes the mirrored
+    // PLAY stream decodable on B's side.
     jobject ch;
     { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
     if (ch) {
-        setProtocolState(env, ch, g_bs.protoPlay);
-        LogTo("login: protocol switched to PLAY");
-
-        if (g_bs.midSession.load(std::memory_order_acquire)) {
+        setProtocolState(env, ch, ProtoState::Configuration);
+        LogTo("login: protocol switched to CONFIGURATION (waiting for A's config stream)");
+        if (kGiveBOwnIdentity && g_bs.midSession.load(std::memory_order_acquire)) {
             LogTo("login: mid-session — rebuilding login for B from A's state");
             reconstructAndSendLoginToB(env, ch);
         }
         env->DeleteLocalRef(ch);
     }
 
-    if (g_bs.keepAlivePacketCtor && g_bs.bChannel) {
-        jobject ka = env->NewObject(g_bs.keepAlivePacketCls,
-                                    g_bs.keepAlivePacketCtor, (jlong)1);
-        if (ka) { writeToB(env, ka); env->DeleteLocalRef(ka); }
+    if (kGiveBOwnIdentity) {
+        // The common keep-alive can be sent in CONFIGURATION or PLAY; sending it
+        // now keeps A's connection from being reaped while B waits.
+        if (g_bs.keepAlivePacketCtor && g_bs.bChannel) {
+            jobject ka = env->NewObject(g_bs.keepAlivePacketCls,
+                                        g_bs.keepAlivePacketCtor, (jlong)1);
+            if (ka) { writeToB(env, ka); env->DeleteLocalRef(ka); }
+        }
+        sendSelfInfoToB(env, uuid, jname);
     }
-
-    sendSelfInfoToB(env, uuid, jname);
 
     unsigned char bBytes[16];
     if (uuidToBytes(env, uuid, bBytes)) {
@@ -1695,29 +2164,24 @@ void completeLogin(JNIEnv* env, jobject hello) {
     env->DeleteLocalRef(uuid);
     env->DeleteLocalRef(jname);
 
-    g_bs.bState.store(BState::Play, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> l(g_bConnMu);
-        g_bConnected = true;
-    }
-    g_bConnCv.notify_all();
-    LogTo("login: B in PLAY (empty world); released A's Render thread — A now "
-          "connects and its live join stream feeds B");
+    // Deliberately NOT switching to Play / releasing the gate here: B has to
+    // finish its configuration phase first, and the packet that ends it comes
+    // from A's real server.  See BServer_ForwardToB.
+    g_bs.bState.store(BState::AwaitConfiguration, std::memory_order_release);
+    LogTo("login: B authenticated, now in CONFIGURATION — A must connect and "
+          "its configuration stream will release B into PLAY");
 }
 
 }
 
 void hideAFromBTab(JNIEnv* env, jobject ch) {
-    if (!g_bs.aRealUuid || !g_bs.friendlyBufCls || !g_bs.friendlyBufCtor ||
+    if (!g_bs.aRealUuid || !g_bs.registryBufCls || !g_bs.registryBufCtor ||
         !g_bs.unpooledCls || !g_bs.unpooledBufferMid || !g_bs.fbbWriteByteMid ||
         !g_bs.fbbWriteVarIntMid || !g_bs.fbbWriteUUIDMid || !g_bs.fbbWriteBooleanMid ||
         !g_bs.playerInfoUpdatePacketCls || !g_bs.playerInfoUpdatePacketBufCtor) return;
 
-    jobject bb = env->CallStaticObjectMethod(g_bs.unpooledCls, g_bs.unpooledBufferMid);
-    if (!bb || env->ExceptionCheck()) { env->ExceptionClear(); return; }
-    jobject buf = env->NewObject(g_bs.friendlyBufCls, g_bs.friendlyBufCtor, bb);
-    env->DeleteLocalRef(bb);
-    if (!buf || env->ExceptionCheck()) { env->ExceptionClear(); return; }
+    jobject buf = newWriteBuf(env);
+    if (!buf) return;
 
     env->CallObjectMethod(buf, g_bs.fbbWriteByteMid, (jint)0x08);
     env->CallObjectMethod(buf, g_bs.fbbWriteVarIntMid, (jint)1);
@@ -1737,7 +2201,7 @@ void hideAFromBTab(JNIEnv* env, jobject ch) {
 void mirrorPlayerInfoUpdateToB(JNIEnv* env, jobject ch, jobject packet) {
     if (!g_bs.playerInfoUpdatePacketCls || !g_bs.playerInfoUpdatePacketBufCtor ||
         !g_bs.playerInfoUpdatePacketWriteMid || !g_bs.friendlyBufCls ||
-        !g_bs.friendlyBufCtor || !g_bs.unpooledCls || !g_bs.unpooledBufferMid ||
+        !g_bs.registryBufCtor || !g_bs.unpooledCls || !g_bs.unpooledBufferMid ||
         !g_bs.byteBufGetByteMid || !g_bs.listSizeMid || !g_bs.listGetMid ||
         !g_bs.piuEntriesMidA || !g_bs.piEntryProfileIdMid ||
         !g_bs.fbbWriteByteMid || !g_bs.fbbWriteVarIntMid || !g_bs.fbbWriteUUIDMid ||
@@ -1745,11 +2209,8 @@ void mirrorPlayerInfoUpdateToB(JNIEnv* env, jobject ch, jobject packet) {
     if (!g_bs.aUuidReady || !g_bs.bUuidReady || !g_bs.bUuidObj) return;
     if (!env->IsInstanceOf(packet, g_bs.playerInfoUpdatePacketCls)) return;
 
-    jobject bb0 = env->CallStaticObjectMethod(g_bs.unpooledCls, g_bs.unpooledBufferMid);
-    if (!bb0 || env->ExceptionCheck()) { env->ExceptionClear(); return; }
-    jobject sbuf = env->NewObject(g_bs.friendlyBufCls, g_bs.friendlyBufCtor, bb0);
-    env->DeleteLocalRef(bb0);
-    if (!sbuf || env->ExceptionCheck()) { env->ExceptionClear(); return; }
+    jobject sbuf = newWriteBuf(env);
+    if (!sbuf) return;
     env->CallVoidMethod(packet, g_bs.playerInfoUpdatePacketWriteMid, sbuf);
     if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(sbuf); return; }
     jint bits = env->CallByteMethod(sbuf, g_bs.byteBufGetByteMid, (jint)0) & 0xFF;
@@ -1796,11 +2257,8 @@ void mirrorPlayerInfoUpdateToB(JNIEnv* env, jobject ch, jobject packet) {
 
     if (outBits == 0) { env->DeleteLocalRef(aEntry); return; }
 
-    jobject bb = env->CallStaticObjectMethod(g_bs.unpooledCls, g_bs.unpooledBufferMid);
-    if (!bb || env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(aEntry); return; }
-    jobject buf = env->NewObject(g_bs.friendlyBufCls, g_bs.friendlyBufCtor, bb);
-    env->DeleteLocalRef(bb);
-    if (!buf || env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(aEntry); return; }
+    jobject buf = newWriteBuf(env);
+    if (!buf) { env->DeleteLocalRef(aEntry); return; }
 
     env->CallObjectMethod(buf, g_bs.fbbWriteByteMid, (jint)outBits);
     env->CallObjectMethod(buf, g_bs.fbbWriteVarIntMid, (jint)1);
@@ -1852,10 +2310,13 @@ void mirrorPlayerInfoUpdateToB(JNIEnv* env, jobject ch, jobject packet) {
 
 void synthesiseMinimalPlayerInfoForUuid(JNIEnv* env, jobject ch,
                                         const unsigned char uuidBytes[16]) {
-    if (!g_bs.unpooledCls || !g_bs.unpooledWrappedMid || !g_bs.friendlyBufCls ||
-        !g_bs.friendlyBufCtor || !g_bs.playerInfoUpdatePacketCls ||
+    if (!g_bs.unpooledCls || !g_bs.unpooledWrappedMid || !g_bs.registryBufCls ||
+        !g_bs.registryBufCtor || !g_bs.playerInfoUpdatePacketCls ||
         !g_bs.playerInfoUpdatePacketBufCtor) return;
 
+    // ADD_PLAYER payload: name, then the profile's property map.  Unchanged
+    // since 1.19; the extra 1.21.2 Entry fields (showHat, listOrder) travel in
+    // their own action bits, so this layout is still valid.
     unsigned char wire[20];
     wire[0] = 0x01;
     wire[1] = 0x01;
@@ -1871,9 +2332,9 @@ void synthesiseMinimalPlayerInfoForUuid(JNIEnv* env, jobject ch,
                                                   g_bs.unpooledWrappedMid, raw);
     env->DeleteLocalRef(raw);
     if (!wrapped || env->ExceptionCheck()) { env->ExceptionClear(); return; }
-    jobject buf = env->NewObject(g_bs.friendlyBufCls, g_bs.friendlyBufCtor, wrapped);
+    jobject buf = wrapRegistryBuf(env, wrapped);
     env->DeleteLocalRef(wrapped);
-    if (!buf || env->ExceptionCheck()) { env->ExceptionClear(); return; }
+    if (!buf) return;
     jobject pkt = env->NewObject(g_bs.playerInfoUpdatePacketCls,
                                  g_bs.playerInfoUpdatePacketBufCtor, buf);
     env->DeleteLocalRef(buf);
@@ -1886,9 +2347,9 @@ void synthesiseMinimalPlayerInfoForUuid(JNIEnv* env, jobject ch,
 }
 
 void ensureTabEntryBeforeAddPlayer(JNIEnv* env, jobject ch, jobject packet) {
-    if (!g_bs.addPlayerPacketCls || !g_bs.addPlayerPacketUuidFid) return;
-    if (!env->IsInstanceOf(packet, g_bs.addPlayerPacketCls)) return;
-    jobject uuid = env->GetObjectField(packet, g_bs.addPlayerPacketUuidFid);
+    if (!g_bs.addEntityPacketCls || !g_bs.addEntityPacketUuidFid) return;
+    if (!env->IsInstanceOf(packet, g_bs.addEntityPacketCls)) return;
+    jobject uuid = env->GetObjectField(packet, g_bs.addEntityPacketUuidFid);
     if (!uuid) { if (env->ExceptionCheck()) env->ExceptionClear(); return; }
     unsigned char bytes[16];
     bool ok = uuidToBytes(env, uuid, bytes);
@@ -1901,7 +2362,7 @@ void mirrorTeamPacketToB(JNIEnv* env, jobject ch, jobject packet) {
     if (!g_bs.setPlayerTeamPacketCls || !g_bs.setPlayerTeamPacketBufCtor ||
         !g_bs.setPlayerTeamMethodFid || !g_bs.setPlayerTeamNameFid ||
         !g_bs.setPlayerTeamPlayersFid || !g_bs.collectionContainsMid ||
-        !g_bs.friendlyBufCls || !g_bs.friendlyBufCtor ||
+        !g_bs.registryBufCls || !g_bs.registryBufCtor ||
         !g_bs.fbbWriteByteMid || !g_bs.fbbWriteVarIntMid || !g_bs.fbbWriteUtfMid ||
         !g_bs.unpooledCls || !g_bs.unpooledBufferMid) return;
     if (!g_bs.aName || !g_bs.bName) return;
@@ -1922,11 +2383,8 @@ void mirrorTeamPacketToB(JNIEnv* env, jobject ch, jobject packet) {
 
     jint outMethod = (method == 4) ? 4 : 3;
 
-    jobject bb = env->CallStaticObjectMethod(g_bs.unpooledCls, g_bs.unpooledBufferMid);
-    if (!bb || env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(teamName); return; }
-    jobject buf = env->NewObject(g_bs.friendlyBufCls, g_bs.friendlyBufCtor, bb);
-    env->DeleteLocalRef(bb);
-    if (!buf || env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(teamName); return; }
+    jobject buf = newWriteBuf(env);
+    if (!buf) { env->DeleteLocalRef(teamName); return; }
 
     env->CallObjectMethod(buf, g_bs.fbbWriteUtfMid, teamName, (jint)32767);
     env->CallObjectMethod(buf, g_bs.fbbWriteByteMid, (jint)outMethod);
@@ -1956,11 +2414,13 @@ void writeOneToBWithTabGuard(JNIEnv* env, jobject ch, jobject packet) {
             LogTo("ForwardToB: skipping ClientboundCustomPayloadPacket (mod channel, count=%d)", n);
         return;
     }
-    ensureTabEntryBeforeAddPlayer(env, ch, packet);
+    if (kGiveBOwnIdentity) ensureTabEntryBeforeAddPlayer(env, ch, packet);
     env->CallObjectMethod(ch, g_bs.channelWriteAndFlushMid, packet);
     if (env->ExceptionCheck()) LogAndClearException(env, "ForwardToB/writeOne");
-    mirrorPlayerInfoUpdateToB(env, ch, packet);
-    mirrorTeamPacketToB(env, ch, packet);
+    if (kGiveBOwnIdentity) {
+        mirrorPlayerInfoUpdateToB(env, ch, packet);
+        mirrorTeamPacketToB(env, ch, packet);
+    }
 }
 
 bool forwardBundleExpanded(JNIEnv* env, jobject ch, jobject packet) {
@@ -2012,17 +2472,61 @@ bool forwardBundleExpanded(JNIEnv* env, jobject ch, jobject packet) {
     return true;
 }
 
-void BServer_ForwardToB(JNIEnv* env, jobject packet) {
+void BServer_ForwardToB(JNIEnv* env, jobject aCtx, jobject packet) {
     if (!packet) return;
-    if (g_bs.bState.load(std::memory_order_acquire) != BState::Play) return;
+
+    static constexpr const char kGame[]   = "net.minecraft.network.protocol.game.";
+    static constexpr const char kConfig[] = "net.minecraft.network.protocol.configuration.";
 
     std::string cls = classNameForB(env, packet);
-    if (cls.rfind("net.minecraft.network.protocol.game.", 0) != 0) return;
+    BState state = g_bs.bState.load(std::memory_order_acquire);
 
     jobject ch;
     { std::lock_guard<std::mutex> l(g_bs.bMu);
       ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
     if (!ch) return;
+
+    // --- configuration phase -------------------------------------------------
+    // B is parked here.  A's own configuration stream is what fills B's
+    // registries, and A's ClientboundFinishConfigurationPacket is what finally
+    // moves B into PLAY.
+    if (state == BState::AwaitConfiguration) {
+        if (cls.rfind(kConfig, 0) != 0) { env->DeleteLocalRef(ch); return; }
+
+        bool finish = g_bs.finishConfigPacketCls &&
+                      env->IsInstanceOf(packet, g_bs.finishConfigPacketCls);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+
+        env->CallObjectMethod(ch, g_bs.channelWriteAndFlushMid, packet);
+        if (env->ExceptionCheck()) LogAndClearException(env, "ForwardToB/config");
+        LogTo("config-mirror: %s%s", cls.c_str(), finish ? "   <-- ends configuration" : "");
+
+        if (finish) {
+            // Deliberately *not* switching B's handlers here: A has not yet been
+            // moved to the PLAY protocol at this point in its own pipeline (see
+            // ensureBPlayProtocol).  B is marked as being in PLAY so the next
+            // packet takes the game branch, which performs the swap first.
+            g_bs.bState.store(BState::Play, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> l(g_bConnMu);
+                g_bConnected = true;
+            }
+            g_bConnCv.notify_all();
+            LogTo("config-mirror: B is in PLAY — A's live join stream now feeds B");
+        }
+        env->DeleteLocalRef(ch);
+        return;
+    }
+
+    if (state != BState::Play) { env->DeleteLocalRef(ch); return; }
+    if (cls.rfind(kGame, 0) != 0) { env->DeleteLocalRef(ch); return; }
+
+    // Swap B onto the PLAY protocol before its first PLAY packet, using the
+    // ProtocolInfos lifted from A's pipeline (correct registry access).
+    if (!g_bs.playProtocolReady) {
+        ensureBPlayProtocol(env, aCtx);
+        setProtocolState(env, ch, ProtoState::Play);
+    }
 
     if (!forwardBundleExpanded(env, ch, packet)) {
         writeOneToBWithTabGuard(env, ch, packet);
@@ -2037,27 +2541,26 @@ void BSide_OnPacket(JNIEnv* env, jobject , jobject msg) {
     LogTo("BServer: RX %s (state=%d)", cls.c_str(), (int)state);
 
     if (g_bs.intentPacketCls && env->IsInstanceOf(msg, g_bs.intentPacketCls)) {
-        jobject nextProto = g_bs.protoLogin;
+        // 1.21.8: the intention field is a ClientIntent enum, not a
+        // ConnectionProtocol, and TRANSFER joined LOGIN/STATUS in 1.20.5.
+        bool wantStatus = false;
         if (g_bs.intentionPacketIntentFid) {
             jobject intent = env->GetObjectField(msg, g_bs.intentionPacketIntentFid);
             if (intent) {
-                if (env->IsSameObject(intent, g_bs.protoStatus)) nextProto = g_bs.protoStatus;
-                else                                             nextProto = g_bs.protoLogin;
+                wantStatus = env->IsSameObject(intent, g_bs.intentStatus);
                 env->DeleteLocalRef(intent);
             }
         }
+        ProtoState nextProto = wantStatus ? ProtoState::Status : ProtoState::Login;
         jobject ch;
         { std::lock_guard<std::mutex> l(g_bs.bMu); ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr; }
         if (ch) {
             setProtocolState(env, ch, nextProto);
             env->DeleteLocalRef(ch);
         }
-        g_bs.bState.store(
-            (nextProto == g_bs.protoStatus) ? BState::AwaitHandshake
-                                             : BState::AwaitLogin,
-            std::memory_order_release);
-        LogTo("BServer: intention → %s",
-              nextProto == g_bs.protoStatus ? "STATUS" : "LOGIN");
+        g_bs.bState.store(wantStatus ? BState::AwaitHandshake : BState::AwaitLogin,
+                          std::memory_order_release);
+        LogTo("BServer: intention → %s", wantStatus ? "STATUS" : "LOGIN");
         return;
     }
 

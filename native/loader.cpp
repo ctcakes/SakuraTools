@@ -227,12 +227,18 @@ static DWORD WINAPI ProxyInitWorker(LPVOID) {
     } else {
         LogTo("ProxyInitWorker: InstallBServer OK — listening on 127.0.0.1:25565");
 
+        // The 1.20.1 build blocked A's Render thread until B had reached PLAY.
+        // That cannot work from 1.20.2 onwards: B's CONFIGURATION phase is
+        // completed from A's own configuration stream, so A *must* be allowed to
+        // connect and talk to its server before B can finish joining.  Blocking
+        // A here would deadlock both clients.  Nothing gates A any more; the
+        // only ordering requirement is that B connects before A does, which the
+        // user controls.
         if (BServer_TryCaptureLiveConnection(env)) {
-            LogTo("ProxyInitWorker: mid-session — A already in-game; live connection captured, gate skipped");
-        } else if (BServer_BlockAMainThreadUntilBConnected(env)) {
-            LogTo("ProxyInitWorker: Queued A Render thread blocking gate task");
+            LogTo("ProxyInitWorker: mid-session — A already in-game; live connection captured");
         } else {
-            LogTo("ProxyInitWorker: Failed to queue A Render thread blocking gate task");
+            LogTo("ProxyInitWorker: A not in-game yet — connect B first, then "
+                  "join a server with A; its configuration stream releases B into PLAY");
         }
     }
 

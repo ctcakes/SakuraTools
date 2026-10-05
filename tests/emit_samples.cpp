@@ -44,6 +44,18 @@ int main(int argc, char** argv) {
         writeAll(outdir + "/HookBridge.class", cb.build());
     }
 
+    // 1.21.8 needs a live implementation of GameProtocols$Context in order to
+    // bind GameProtocols.SERVERBOUND_TEMPLATE into a ProtocolInfo.  That is the
+    // only place ClassBuilder::addInterface is used, so exercise exactly that
+    // shape here: a class that implements an interface and implements its
+    // single method natively.
+    {
+        ClassBuilder cb("gen/GameContext", "java/lang/Object", 52);
+        cb.addInterface("GameContextContract");
+        cb.addNativeMethod("hasInfiniteMaterials", "()Z", ACC_PUBLIC | ACC_NATIVE);
+        writeAll(outdir + "/GameContext.class", cb.build());
+    }
+
     {
         const char* super_ = "io/netty/channel/ChannelDuplexHandler";
         ClassBuilder cb("gen/RelayHandler", super_, 52);

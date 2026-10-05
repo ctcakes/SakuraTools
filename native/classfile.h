@@ -47,6 +47,8 @@ public:
     u2 fieldRef(std::string_view klass, std::string_view name, std::string_view desc);
     u2 stringRef(std::string_view s);
 
+    void addInterface(std::string_view internalName);
+
     void addNativeMethod(std::string_view name,
                          std::string_view descriptor,
                          u2 accessFlags = ACC_PUBLIC | ACC_STATIC | ACC_NATIVE);
@@ -80,6 +82,8 @@ private:
     std::string super_internal_;
     u2          major_version_;
     u2          access_flags_ = ACC_PUBLIC | ACC_SUPER;
+
+    std::vector<u2>                interfaces_;
 
     std::vector<RawEntry>          cp_;
     std::map<std::string, u2>      utf8_index_;

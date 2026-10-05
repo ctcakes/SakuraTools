@@ -89,10 +89,17 @@ void JNICALL Native_RelayChannelRead(JNIEnv* env,
                                      jobject msg) {
 
     std::string cls = javaClassName(env, msg);
-    bool mirrorToB = BServer_IsBActive() &&
-        cls.rfind("net.minecraft.network.protocol.game.", 0) == 0;
-    if (mirrorToB) {
-        BServer_ForwardToB(env, msg);
+
+    // 1.20.2 inserted a CONFIGURATION phase between LOGIN and PLAY, and that is
+    // where the client receives the registry contents it later decodes PLAY
+    // packets against.  B is held in that phase until A's own stream has been
+    // mirrored across, so configuration packets have to be forwarded too --
+    // BServer_ForwardToB decides which prefix is relevant for B's current state.
+    static constexpr const char kGame[]   = "net.minecraft.network.protocol.game.";
+    static constexpr const char kConfig[] = "net.minecraft.network.protocol.configuration.";
+    if (BServer_ShouldMirror() &&
+        (cls.rfind(kGame, 0) == 0 || cls.rfind(kConfig, 0) == 0)) {
+        BServer_ForwardToB(env, ctx, msg);
     }
 
     env->CallObjectMethod(ctx, g_relay.netty.fireChannelReadMid, msg);
