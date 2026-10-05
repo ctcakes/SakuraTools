@@ -2,17 +2,33 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <iphlpapi.h>
 #include <tlhelp32.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
 BOOL DoInject(DWORD dwProcessId, const char* cpDllFile,
               char* outMessage, int maxLen);
 
+// Substring of the Minecraft window title to look for.  Every launcher titles
+// the window differently ("KKCraft Client @ ...", "布吉岛", "Minecraft 1.21.8"),
+// so this is overridable on the command line rather than baked in.
+static wchar_t g_title_needle[256] = L"KKCraft";
+
+static void set_title_needle(const char* utf8) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, g_title_needle,
+                                (int)(sizeof(g_title_needle) / sizeof(g_title_needle[0])));
+    if (n <= 0) g_title_needle[0] = 0;
+}
+
 static int usage(const char* argv0) {
-    fprintf(stderr, "usage: %s <dll-path>\n", argv0);
+    fprintf(stderr,
+            "usage: %s <dll-path> [window-title-substring]\n"
+            "  window-title-substring defaults to \"KKCraft\";\n"
+            "  pass \"\" to match any visible Java window.\n", argv0);
     return 2;
 }
 
@@ -20,6 +36,54 @@ typedef struct ProcessChoice {
     DWORD pid;
     ULONGLONG created;
 } ProcessChoice;
+
+// Injecting means OpenProcess(PROCESS_ALL_ACCESS) + CreateRemoteThread on
+// someone else's process.  If the game was started from an elevated launcher
+// that fails with ERROR_ACCESS_DENIED, so we re-launch ourselves through the
+// UAC prompt rather than making the user do it by hand.
+static BOOL is_elevated(void) {
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return FALSE;
+    TOKEN_ELEVATION elevation;
+    DWORD len = 0;
+    BOOL ok = GetTokenInformation(token, TokenElevation, &elevation,
+                                  sizeof(elevation), &len);
+    CloseHandle(token);
+    return ok && elevation.TokenIsElevated;
+}
+
+static BOOL relaunch_elevated(const char* dll, const wchar_t* needle) {
+    wchar_t exe[MAX_PATH];
+    if (GetModuleFileNameW(NULL, exe, MAX_PATH) == 0) return FALSE;
+
+    wchar_t wdll[MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, dll, -1, wdll, MAX_PATH) <= 0) return FALSE;
+
+    // Quote both paths; a launcher directory with a space is common enough.
+    wchar_t params[MAX_PATH * 2 + 16];
+    _snwprintf(params, sizeof(params) / sizeof(params[0]), L"\"%ls\" \"%ls\"",
+               wdll, needle);
+
+    SHELLEXECUTEINFOW sei;
+    ZeroMemory(&sei, sizeof(sei));
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = params;
+    sei.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&sei)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_CANCELLED)
+            fprintf(stderr, "UAC prompt was declined.\n");
+        else
+            fprintf(stderr, "could not re-launch elevated (error %lu).\n", err);
+        return FALSE;
+    }
+    if (sei.hProcess) CloseHandle(sei.hProcess);
+    return TRUE;
+}
 
 static BOOL is_java_process(DWORD pid) {
     BOOL found = FALSE;
@@ -58,19 +122,19 @@ static ULONGLONG process_creation_time(DWORD pid) {
     return value;
 }
 
-static BOOL title_is_buji_island(const wchar_t* title) {
-    static const wchar_t buji_island[] = {0x5e03, 0x5409, 0x5c9b, 0};
-    return wcsstr(title, buji_island) != NULL;
+static BOOL title_matches(const wchar_t* title) {
+    if (g_title_needle[0] == 0) return TRUE;
+    return wcsstr(title, g_title_needle) != NULL;
 }
 
-static BOOL CALLBACK find_buji_island_window(HWND window, LPARAM param) {
+static BOOL CALLBACK find_mc_window(HWND window, LPARAM param) {
     ProcessChoice* choice = (ProcessChoice*)param;
     if (!IsWindowVisible(window)) return TRUE;
 
     wchar_t title[512];
     if (GetWindowTextW(window, title, (int)(sizeof(title) / sizeof(title[0]))) <= 0)
         return TRUE;
-    if (!title_is_buji_island(title)) return TRUE;
+    if (!title_matches(title)) return TRUE;
 
     DWORD pid = 0;
     GetWindowThreadProcessId(window, &pid);
@@ -84,20 +148,22 @@ static BOOL CALLBACK find_buji_island_window(HWND window, LPARAM param) {
     return TRUE;
 }
 
-static DWORD find_buji_island_process(void) {
+static DWORD find_mc_process(void) {
     ProcessChoice choice;
     ZeroMemory(&choice, sizeof(choice));
-    EnumWindows(find_buji_island_window, (LPARAM)&choice);
+    EnumWindows(find_mc_window, (LPARAM)&choice);
     return choice.pid;
 }
 
-static DWORD wait_for_buji_island_process(void) {
-    fprintf(stdout,
-            "waiting for a visible Java window containing "
-            "U+5E03 U+5409 U+5C9B...\n");
+static DWORD wait_for_mc_process(void) {
+    if (g_title_needle[0])
+        fprintf(stdout, "waiting for a visible Java window whose title contains \"%ls\"...\n",
+                g_title_needle);
+    else
+        fprintf(stdout, "waiting for any visible Java window...\n");
     fflush(stdout);
     for (;;) {
-        DWORD pid = find_buji_island_process();
+        DWORD pid = find_mc_process();
         if (pid) return pid;
         Sleep(50);
     }
@@ -145,18 +211,36 @@ static BOOL wait_for_proxy_listener(DWORD pid) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2) return usage(argv[0]);
+    if (argc < 2 || argc > 3) return usage(argv[0]);
 
     unsigned long pid = 0;
     const char* dll = argv[1];
+
+    if (argc == 3) set_title_needle(argv[2]);
 
     if (GetFileAttributesA(dll) == INVALID_FILE_ATTRIBUTES) {
         fprintf(stderr, "dll not found: %s\n", dll);
         return 2;
     }
 
-    pid = wait_for_buji_island_process();
-    fprintf(stdout, "matched Buji Island Java window, PID %lu\n", pid);
+    // Elevate up front rather than waiting for the first ERROR_ACCESS_DENIED:
+    // the elevated instance then does the window-waiting too, so the user sees
+    // exactly one UAC prompt.  The child is already elevated, so it will not
+    // re-enter this branch.
+    if (!is_elevated()) {
+        fprintf(stdout, "not running as administrator - requesting elevation (UAC)...\n");
+        fflush(stdout);
+        if (relaunch_elevated(dll, g_title_needle)) {
+            fprintf(stdout, "continuing in the elevated window.\n");
+            return 0;
+        }
+        fprintf(stderr, "continuing without elevation (injection will likely fail "
+                        "with access denied).\n");
+    }
+
+    pid = wait_for_mc_process();
+    fprintf(stdout, "matched Java window (title contains \"%ls\"), PID %lu\n",
+            g_title_needle[0] ? g_title_needle : L"*", pid);
 
     char msg[1024];
     BOOL ok = DoInject((DWORD)pid, dll, msg, (int)sizeof(msg));

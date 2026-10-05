@@ -8,7 +8,9 @@ $Injector  = Join-Path $Here 'reflective_injector.exe'
 $InjectPs1 = Join-Path $Here 'inject.ps1'
 $LogPath   = Join-Path $env:TEMP 'MinecraftProxy.log'
 $ProxyPort = 25565
-$BujiIsland = [char]0x5e03 + [char]0x5409 + [char]0x5c9b
+# Substring of the Minecraft window title.  Every launcher titles the window
+# differently, so this is overridable: set MC_WINDOW_TITLE before running.
+$TitleMatch = if ($env:MC_WINDOW_TITLE) { $env:MC_WINDOW_TITLE } else { 'KKCraft' }
 
 function Write-Kv([string]$k, $v, [ConsoleColor]$vcolor = 'White') {
     Write-Host ("  {0,-18}: " -f $k) -NoNewline -ForegroundColor DarkGray
@@ -35,7 +37,7 @@ function Find-McProcess {
         if (-not [Native.W32]::IsWindowVisible($h)) { return $true }
         $sb.Length = 0
         [void][Native.W32]::GetWindowText($h, $sb, $sb.Capacity)
-        if ($sb.ToString() -match [regex]::Escape($BujiIsland)) {
+        if ($sb.ToString() -match [regex]::Escape($TitleMatch)) {
             $p = 0
             [void][Native.W32]::GetWindowThreadProcessId($h, [ref]$p)
             if ($p -gt 0) {
@@ -102,7 +104,7 @@ function Show-Status {
         Write-Kv "DLL" ("MISSING - expected {0}" -f $Dll) Red
     }
     if (Test-Path $Injector) {
-        Write-Kv "Injector" ("reflective_injector.exe (auto-wait for `"{0}`" window)" -f $BujiIsland) Green
+        Write-Kv "Injector" ("reflective_injector.exe (auto-wait for `"{0}`" window)" -f $TitleMatch) Green
     } else {
         Write-Kv "Injector" 'MISSING - will fall back to inject.ps1' Yellow
     }

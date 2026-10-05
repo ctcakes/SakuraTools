@@ -736,6 +736,47 @@ void JNICALL Native_BSide_channelActive(JNIEnv* , jobject , jobject ) {
     LogTo("BServer: B channelActive");
 }
 
+// B can sit in CONFIGURATION for as long as it takes A to join a server, and
+// the client tears the connection down after 30 s of silence (ReadTimeoutHandler
+// in Connection.connectToServer).  ClientboundKeepAlivePacket is valid in both
+// CONFIGURATION and PLAY, so a slow tick keeps B alive without pushing it
+// forward through the phase.
+DWORD WINAPI BKeepAliveThread(LPVOID) {
+    LogTo("keepalive: watchdog started");
+    JniAttach attach;
+    if (!attach) { LogTo("keepalive: could not attach thread"); return 0; }
+    JNIEnv* env = attach.env;
+    jlong seq = 0;
+
+    for (;;) {
+        Sleep(10000);
+        if (g_bs.bState.load(std::memory_order_acquire) != BState::AwaitConfiguration)
+            continue;
+        if (!g_bs.keepAlivePacketCls || !g_bs.keepAlivePacketCtor) continue;
+
+        jobject ch;
+        {
+            std::lock_guard<std::mutex> l(g_bs.bMu);
+            ch = g_bs.bChannel ? env->NewLocalRef(g_bs.bChannel) : nullptr;
+        }
+        if (!ch) continue;
+
+        jobject ka = env->NewObject(g_bs.keepAlivePacketCls, g_bs.keepAlivePacketCtor,
+                                    (jlong)++seq);
+        if (ka && !env->ExceptionCheck()) {
+            env->CallObjectMethod(ch, g_bs.channelWriteAndFlushMid, ka);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            LogTo("keepalive: nudged B while it waits in CONFIGURATION (id=%lld)",
+                  (long long)seq);
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        if (ka) env->DeleteLocalRef(ka);
+        env->DeleteLocalRef(ch);
+    }
+    return 0;
+}
+
 void closeARemoteConnection(JNIEnv* env) {
     if (!g_bs.connectionChannelFid || !g_bs.channelCloseMid) return;
     jobject conn;
@@ -1688,7 +1729,11 @@ bool InstallBServer(JNIEnv* env) {
            && defineGameContextClass(env, mcLoader)
            && cacheJavaRefs(env, mcLoader) && bindServer(env, mcLoader);
     env->DeleteGlobalRef(mcLoader);
-    if (ok) g_bs.bServerBound = true;
+    if (ok) {
+        g_bs.bServerBound = true;
+        HANDLE h = CreateThread(nullptr, 0, BKeepAliveThread, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+    }
     return ok;
 }
 

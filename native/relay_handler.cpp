@@ -127,7 +127,18 @@ void JNICALL Native_RelayWrite(JNIEnv* env,
 
     bool bypass = consumeBypassMark(env, msg);
     bool allow = bypass || shouldAllowC2S(cls);
-    LogTo("[C2S %s] %s", bypass ? "ROUTE" : (allow ? "PASS" : "DROP"), cls.c_str());
+
+    // Movement and tick packets fire several times a second, so logging every
+    // PASS buries everything else in proxy.log.  Anything the filter actually
+    // acts on (DROP / ROUTE) is always logged; plain PASS is sampled.
+    if (!allow || bypass) {
+        LogTo("[C2S %s] %s", bypass ? "ROUTE" : "DROP", cls.c_str());
+    } else {
+        static std::atomic<unsigned> passCount{0};
+        unsigned n = passCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 20 || (n & 0x3FF) == 0)
+            LogTo("[C2S PASS] %s (sampled; %u allowed so far)", cls.c_str(), n);
+    }
 
     if (allow) {
         env->CallObjectMethod(ctx, g_relay.netty.ctxWriteMid, msg, promise);
