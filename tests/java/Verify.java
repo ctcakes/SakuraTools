@@ -18,6 +18,13 @@ public class Verify {
                 Class<?> c = loader.defineFromBytes(name, bytes);
 
                 Class.forName(c.getName(), true, loader);
+                c.getDeclaredMethods();
+                if (name.equals("RelayHandler")) {
+                    c.getDeclaredMethod("channelInactive", io.netty.channel.ChannelHandlerContext.class);
+                    c.getDeclaredMethod("channelRead", io.netty.channel.ChannelHandlerContext.class, Object.class);
+                    c.getDeclaredMethod("write", io.netty.channel.ChannelHandlerContext.class, Object.class, io.netty.channel.ChannelPromise.class);
+                    c.getDeclaredConstructor().newInstance();
+                }
                 System.out.println("OK   " + name + "  (loaded " + c.getName() + ")");
             } catch (Throwable t) {
                 System.out.println("FAIL " + name + "  " + t.getClass().getName()

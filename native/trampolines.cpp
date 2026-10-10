@@ -44,7 +44,6 @@ void JNICALL Native_onChannelActive(JNIEnv* env,
     LogTo("Native_onChannelActive fired: conn=%p ctx=%p",
           (void*)connection, (void*)ctx);
 
-    BServer_SetTargetConnection(env, connection);
     RelayHandler_AttachToPipeline(env, ctx);
 
     LogTo("Native_onChannelActive returning");

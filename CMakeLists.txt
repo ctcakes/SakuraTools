@@ -1,11 +1,24 @@
 cmake_minimum_required(VERSION 3.21)
 project(MinecraftInjectedProxy LANGUAGES C CXX)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(PROXY_NATIVE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/native")
+
+if(BUILD_TESTING)
+    add_executable(b_chat_route_test tests/b_chat_route_test.cpp)
+    target_include_directories(b_chat_route_test PRIVATE "${PROXY_NATIVE_DIR}")
+    add_test(NAME b_chat_route COMMAND b_chat_route_test)
+    add_executable(protocol_session_test tests/protocol_session_test.cpp)
+    target_include_directories(protocol_session_test PRIVATE "${PROXY_NATIVE_DIR}")
+    add_test(NAME protocol_session COMMAND protocol_session_test)
+    add_executable(edit_self_test tests/edit_self_test.cpp native/classfile.cpp native/class_edit.cpp)
+    add_test(NAME class_edit COMMAND edit_self_test)
+    add_executable(emit_samples tests/emit_samples.cpp native/classfile.cpp native/class_edit.cpp)
+endif()
 
 add_library(MinecraftProxy_msvc SHARED
     native/ReflectiveLoader.c

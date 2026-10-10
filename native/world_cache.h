@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+// Legacy API only: observe/replay are disabled; no partial-history late join.
 class WorldStateCache {
 public:
 

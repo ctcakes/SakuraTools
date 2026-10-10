@@ -60,7 +60,11 @@ int main(int argc, char** argv) {
         cb.addNativeMethod("write",
                            "(Lio/netty/channel/ChannelHandlerContext;Ljava/lang/Object;Lio/netty/channel/ChannelPromise;)V",
                            ACC_PUBLIC | ACC_NATIVE);
+        cb.addNativeMethod("channelInactive", "(Lio/netty/channel/ChannelHandlerContext;)V", ACC_PUBLIC | ACC_NATIVE);
         writeAll(outdir + "/RelayHandler.class", cb.build());
+        ClassBuilder bad("gen/InvalidStack", "java/lang/Object", 52);
+        bad.addCodedMethod("broken", "()I", ACC_PUBLIC | ACC_STATIC, {0xAC}, 0, 0);
+        writeAll(outdir + "/InvalidStack.class", bad.build());
     }
 
     {

@@ -56,65 +56,16 @@ WorldStateCache::Category WorldStateCache::categorize(std::string_view fqcn) {
 }
 
 void WorldStateCache::observe(JNIEnv* env, jobject packetLocalRef) {
-    if (!packetLocalRef) return;
-    std::string cls = classNameFor(env, packetLocalRef);
-    Category cat = categorize(cls);
-    if (cat == Category::Ignored) return;
-
-    jobject g = env->NewGlobalRef(packetLocalRef);
-    if (!g) return;
-
-    std::lock_guard<std::mutex> lock(m_);
-
-    auto replaceLatest = [&](jobject& slot) {
-        if (slot) env->DeleteGlobalRef(slot);
-        slot = g;
-    };
-    auto pushCapped = [&](std::vector<jobject>& list, size_t cap) {
-        list.push_back(g);
-        while (list.size() > cap) {
-            env->DeleteGlobalRef(list.front());
-            list.erase(list.begin());
-        }
-    };
-
-    switch (cat) {
-        case Category::LatestLogin:          replaceLatest(login_); break;
-        case Category::LatestGameEvent:      replaceLatest(gameEvent_); break;
-        case Category::LatestSetTime:        replaceLatest(setTime_); break;
-        case Category::LatestPlayerPosition: replaceLatest(playerPos_); break;
-        case Category::AppendPlayerInfo:     pushCapped(playerInfo_, kMaxPlayerInfo); break;
-        case Category::AppendEntity:         pushCapped(entities_, kMaxEntities); break;
-        case Category::AppendChunk:          pushCapped(chunks_, kMaxChunks); break;
-        default: env->DeleteGlobalRef(g); break;
-    }
+    // Partial packet histories cannot reconstruct registry state or a respawn safely.
+    (void)env;
+    (void)packetLocalRef;
 }
 
-void WorldStateCache::replay(JNIEnv* env, jobject connection,
-                             jmethodID connSendMid) const {
-    if (!connection || !connSendMid) return;
-    auto send = [&](jobject p) {
-        if (!p) return;
-        env->CallVoidMethod(connection, connSendMid, p);
-        if (env->ExceptionCheck()) {
-            LogTo("replay: send threw for one packet");
-            env->ExceptionClear();
-        }
-    };
-    std::lock_guard<std::mutex> lock(m_);
-    LogTo("replay: login=%p gameEvent=%p setTime=%p playerInfo=%zu entities=%zu chunks=%zu pos=%p",
-          (void*)login_, (void*)gameEvent_, (void*)setTime_,
-          playerInfo_.size(), entities_.size(), chunks_.size(),
-          (void*)playerPos_);
-
-    send(login_);
-    send(gameEvent_);
-    send(setTime_);
-    for (jobject p : playerInfo_) send(p);
-    for (jobject p : entities_)   send(p);
-    for (jobject p : chunks_)     send(p);
-    send(playerPos_);
-    LogTo("replay: done");
+void WorldStateCache::replay(JNIEnv* env, jobject connection, jmethodID connSendMid) const {
+    (void)env;
+    (void)connection;
+    (void)connSendMid;
+    LogTo("WorldStateCache: replay disabled; fresh configuration is required");
 }
 
 void WorldStateCache::clear(JNIEnv* env) {

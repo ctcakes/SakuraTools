@@ -3,9 +3,8 @@
 #include "b_server.h"
 #include "classfile.h"
 #include "random_name.h"
-#include "world_cache.h"
 
-#include <atomic>
+
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -26,7 +25,7 @@ constexpr const char* kChannelReadDesc =
 constexpr const char* kWriteDesc =
     "(Lio/netty/channel/ChannelHandlerContext;Ljava/lang/Object;Lio/netty/channel/ChannelPromise;)V";
 
-std::atomic<uint64_t> g_channelSeq{0};
+
 
 std::mutex g_bypassMu;
 std::vector<jobject> g_bypassPending;
@@ -41,23 +40,6 @@ bool consumeBypassMark(JNIEnv* env, jobject msg) {
         }
     }
     return false;
-}
-
-void printlnUtf8(JNIEnv* env, const char* line) {
-    jclass sysCls = env->FindClass("java/lang/System");
-    jfieldID outFid =
-        env->GetStaticFieldID(sysCls, "out", "Ljava/io/PrintStream;");
-    jobject out = env->GetStaticObjectField(sysCls, outFid);
-    jclass psCls = env->GetObjectClass(out);
-    jmethodID pmid =
-        env->GetMethodID(psCls, "println", "(Ljava/lang/String;)V");
-    jstring js = env->NewStringUTF(line);
-    env->CallVoidMethod(out, pmid, js);
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    env->DeleteLocalRef(js);
-    env->DeleteLocalRef(psCls);
-    env->DeleteLocalRef(out);
-    env->DeleteLocalRef(sysCls);
 }
 
 std::string javaClassName(JNIEnv* env, jobject o) {
@@ -88,27 +70,17 @@ void JNICALL Native_RelayChannelRead(JNIEnv* env,
                                      jobject ctx,
                                      jobject msg) {
 
-    std::string cls = javaClassName(env, msg);
-    bool mirrorToB = BServer_IsBActive() &&
-        cls.rfind("net.minecraft.network.protocol.game.", 0) == 0;
-    if (mirrorToB) {
-        BServer_ForwardToB(env, msg);
-    }
-
-    env->CallObjectMethod(ctx, g_relay.netty.fireChannelReadMid, msg);
+    BServer_OnARead(env, ctx, msg);
+    jobject next = env->CallObjectMethod(ctx, g_relay.netty.fireChannelReadMid, msg);
+    if (next) env->DeleteLocalRef(next);
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
-bool shouldAllowC2S(const std::string& fqcn) {
-
-    static constexpr const char kGamePrefix[] =
-        "net.minecraft.network.protocol.game.";
-    if (fqcn.rfind(kGamePrefix, 0) != 0) return true;
-
-    if (!BServer_IsBActive()) return true;
-
-    const char* simple = fqcn.c_str() + (sizeof(kGamePrefix) - 1);
-    return std::strcmp(simple, "ServerboundCustomPayloadPacket") == 0;
+void JNICALL Native_RelayChannelInactive(JNIEnv* env, jobject, jobject ctx) {
+    BServer_OnAInactive(env, ctx);
+    jobject next = env->CallObjectMethod(ctx, g_relay.netty.fireChannelInactiveMid);
+    if (next) env->DeleteLocalRef(next);
+    if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
 void JNICALL Native_RelayWrite(JNIEnv* env,
@@ -119,14 +91,16 @@ void JNICALL Native_RelayWrite(JNIEnv* env,
     std::string cls = javaClassName(env, msg);
 
     bool bypass = consumeBypassMark(env, msg);
-    bool allow = bypass || shouldAllowC2S(cls);
+    bool allow = bypass || BServer_OnAWrite(env, ctx, msg);
     LogTo("[C2S %s] %s", bypass ? "ROUTE" : (allow ? "PASS" : "DROP"), cls.c_str());
 
     if (allow) {
-        env->CallObjectMethod(ctx, g_relay.netty.ctxWriteMid, msg, promise);
+        jobject future = env->CallObjectMethod(ctx, g_relay.netty.ctxWriteMid, msg, promise);
+        if (future) env->DeleteLocalRef(future);
     } else {
         if (promise && g_relay.netty.promiseSetSuccessMid) {
-            env->CallObjectMethod(promise, g_relay.netty.promiseSetSuccessMid);
+            jobject completed = env->CallObjectMethod(promise, g_relay.netty.promiseSetSuccessMid);
+            if (completed) env->DeleteLocalRef(completed);
         }
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
@@ -150,6 +124,7 @@ bool defineRelayClass(JNIEnv* env, jobject mcLoader) {
 
     cb.addNativeMethod("channelRead", kChannelReadDesc,
                        ACC_PUBLIC | ACC_NATIVE);
+    cb.addNativeMethod("channelInactive", "(Lio/netty/channel/ChannelHandlerContext;)V", ACC_PUBLIC | ACC_NATIVE);
     cb.addNativeMethod("write", kWriteDesc,
                        ACC_PUBLIC | ACC_NATIVE);
 
@@ -172,8 +147,9 @@ bool defineRelayClass(JNIEnv* env, jobject mcLoader) {
         { const_cast<char*>("write"),
           const_cast<char*>(kWriteDesc),
           reinterpret_cast<void*>(&Native_RelayWrite) },
+        { const_cast<char*>("channelInactive"), const_cast<char*>("(Lio/netty/channel/ChannelHandlerContext;)V"), reinterpret_cast<void*>(&Native_RelayChannelInactive) },
     };
-    if (env->RegisterNatives(defined, natives, 2) != 0) {
+    if (env->RegisterNatives(defined, natives, 3) != 0) {
         LogAndClearException(env, "InstallRelayHandler/RegisterNatives");
         env->DeleteLocalRef(defined);
         return false;
@@ -205,6 +181,7 @@ bool cacheNettyRefs(JNIEnv* env, jobject mcLoader) {
     g_relay.netty.fireChannelReadMid = env->GetMethodID(
         ctxCls, "fireChannelRead",
         "(Ljava/lang/Object;)Lio/netty/channel/ChannelHandlerContext;");
+    g_relay.netty.fireChannelInactiveMid = env->GetMethodID(ctxCls, "fireChannelInactive", "()Lio/netty/channel/ChannelHandlerContext;");
     g_relay.netty.ctxWriteMid = env->GetMethodID(
         ctxCls, "write",
         "(Ljava/lang/Object;Lio/netty/channel/ChannelPromise;)Lio/netty/channel/ChannelFuture;");
@@ -217,9 +194,8 @@ bool cacheNettyRefs(JNIEnv* env, jobject mcLoader) {
                                       "io.netty.channel.ChannelPipeline");
     if (!pipCls) { Dbg("Relay: couldn't load ChannelPipeline"); return false; }
     g_relay.netty.pipelineCls = static_cast<jclass>(env->NewGlobalRef(pipCls));
-    g_relay.netty.addFirstMid = env->GetMethodID(
-        pipCls, "addFirst",
-        "(Ljava/lang/String;Lio/netty/channel/ChannelHandler;)Lio/netty/channel/ChannelPipeline;");
+    g_relay.netty.getMid = env->GetMethodID(pipCls, "get", "(Ljava/lang/String;)Lio/netty/channel/ChannelHandler;");
+    g_relay.netty.namesMid = env->GetMethodID(pipCls, "names", "()Ljava/util/List;");
     g_relay.netty.addBeforeMid = env->GetMethodID(
         pipCls, "addBefore",
         "(Ljava/lang/String;Ljava/lang/String;Lio/netty/channel/ChannelHandler;)Lio/netty/channel/ChannelPipeline;");
@@ -234,7 +210,7 @@ bool cacheNettyRefs(JNIEnv* env, jobject mcLoader) {
     env->DeleteLocalRef(promCls);
 
     if (!g_relay.netty.pipelineMid || !g_relay.netty.fireChannelReadMid ||
-        !g_relay.netty.ctxWriteMid  || !g_relay.netty.addFirstMid ||
+        !g_relay.netty.ctxWriteMid  || !g_relay.netty.getMid || !g_relay.netty.namesMid || !g_relay.netty.fireChannelInactiveMid ||
         !g_relay.netty.addBeforeMid || !g_relay.netty.promiseSetSuccessMid) {
         Dbg("Relay: one or more netty method IDs missing");
         return false;
@@ -250,11 +226,19 @@ void RelayFilter_MarkBypass(JNIEnv* env, jobject packet) {
     if (!gref) return;
     std::lock_guard<std::mutex> lock(g_bypassMu);
 
-    if (g_bypassPending.size() > 256) {
-        env->DeleteGlobalRef(g_bypassPending.front());
-        g_bypassPending.erase(g_bypassPending.begin());
-    }
+    // A queued write must keep its mark until consumption, send failure, or session cleanup.
     g_bypassPending.push_back(gref);
+}
+
+void RelayFilter_UnmarkBypass(JNIEnv* env, jobject packet) {
+    if (env && packet) consumeBypassMark(env, packet);
+}
+
+void RelayFilter_ClearBypass(JNIEnv* env) {
+    if (!env) return;
+    std::lock_guard<std::mutex> lock(g_bypassMu);
+    for (jobject packet : g_bypassPending) env->DeleteGlobalRef(packet);
+    g_bypassPending.clear();
 }
 
 bool InstallRelayHandler(JNIEnv* env) {
@@ -264,17 +248,32 @@ bool InstallRelayHandler(JNIEnv* env) {
     jobject mcLoader = GetMinecraftClassLoader(env, g_jvmti);
     if (!mcLoader) return false;
 
-    bool ok = defineRelayClass(env, mcLoader) && cacheNettyRefs(env, mcLoader);
+    bool ok = cacheNettyRefs(env, mcLoader) && defineRelayClass(env, mcLoader);
     env->DeleteGlobalRef(mcLoader);
     return ok;
 }
 
 static void attachHandlerToPipeline(JNIEnv* env, jobject pipeline) {
-    uint64_t seq = ++g_channelSeq;
-    char nameBuf[64];
-    std::snprintf(nameBuf, sizeof(nameBuf), "proxy_relay_%llu",
-                  static_cast<unsigned long long>(seq));
-    jstring name = env->NewStringUTF(nameBuf);
+    jstring name = env->NewStringUTF("sakura_protocol_relay");
+    jobject existing = env->CallObjectMethod(pipeline, g_relay.netty.getMid, name);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(name); return; }
+    if (existing) { env->DeleteLocalRef(existing); env->DeleteLocalRef(name); return; }
+    jobject names = env->CallObjectMethod(pipeline, g_relay.netty.namesMid);
+    jclass listCls = env->FindClass("java/util/List");
+    jmethodID indexOf = env->GetMethodID(listCls, "indexOf", "(Ljava/lang/Object;)I");
+    jstring decoder = env->NewStringUTF("decoder");
+    jstring inboundConfig = env->NewStringUTF("inbound_config");
+    jstring packetHandler = env->NewStringUTF("packet_handler");
+    jint decoderIndex = names ? env->CallIntMethod(names, indexOf, decoder) : -1;
+    if (decoderIndex < 0 && names && !env->ExceptionCheck())
+        decoderIndex = env->CallIntMethod(names, indexOf, inboundConfig);
+    jint handlerIndex = names ? env->CallIntMethod(names, indexOf, packetHandler) : -1;
+    bool valid = !env->ExceptionCheck() && decoderIndex >= 0 && handlerIndex > decoderIndex;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(decoder); env->DeleteLocalRef(inboundConfig);
+    env->DeleteLocalRef(packetHandler); env->DeleteLocalRef(listCls);
+    if (names) env->DeleteLocalRef(names);
+    if (!valid) { LogTo("Attach: codec anchors missing or out of order; skipped"); env->DeleteLocalRef(name); return; }
 
     jobject handler = env->NewObject(g_relay.klass, g_relay.ctor);
     if (!handler || env->ExceptionCheck()) {
@@ -287,24 +286,12 @@ static void attachHandlerToPipeline(JNIEnv* env, jobject pipeline) {
     jstring base = env->NewStringUTF("packet_handler");
     jobject unused = env->CallObjectMethod(
         pipeline, g_relay.netty.addBeforeMid, base, name, handler);
-    bool addBeforeFailed = env->ExceptionCheck();
-    const char* mode;
-    if (addBeforeFailed) {
+    if (env->ExceptionCheck()) {
         env->ExceptionClear();
-        LogTo("Attach: addBefore(packet_handler,...) THREW, falling back to addFirst");
-        unused = env->CallObjectMethod(
-            pipeline, g_relay.netty.addFirstMid, name, handler);
-        if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-            LogTo("Attach: addFirst ALSO threw — giving up");
-            mode = "FAILED";
-        } else {
-            mode = "HEAD-fallback";
-        }
+        LogTo("Attach: addBefore failed; no unsafe fallback");
     } else {
-        mode = "before-packet_handler";
+        LogTo("Attach: installed relay before packet_handler");
     }
-    LogTo("Attach: %s as %s (class %s)", mode, nameBuf, g_relay.dotName.c_str());
     if (unused) env->DeleteLocalRef(unused);
     env->DeleteLocalRef(base);
     env->DeleteLocalRef(handler);

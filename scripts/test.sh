@@ -20,6 +20,8 @@ echo "==[ pure C++ round-trip ]=="
 echo "==[ compile Java stubs ]=="
 javac -d "$CLASSPATH_OUT" \
     "$ROOT/tests/java/ChannelDuplexHandler.java" \
+    "$ROOT/tests/java/ChannelHandlerContext.java" \
+    "$ROOT/tests/java/ChannelPromise.java" \
     "$ROOT/tests/java/Connection.java"
 javac -d "$BUILD" "$ROOT/tests/java/Verify.java"
 

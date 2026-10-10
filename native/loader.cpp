@@ -227,13 +227,7 @@ static DWORD WINAPI ProxyInitWorker(LPVOID) {
     } else {
         LogTo("ProxyInitWorker: InstallBServer OK — listening on 127.0.0.1:25565");
 
-        if (BServer_TryCaptureLiveConnection(env)) {
-            LogTo("ProxyInitWorker: mid-session — A already in-game; live connection captured, gate skipped");
-        } else if (BServer_BlockAMainThreadUntilBConnected(env)) {
-            LogTo("ProxyInitWorker: Queued A Render thread blocking gate task");
-        } else {
-            LogTo("ProxyInitWorker: Failed to queue A Render thread blocking gate task");
-        }
+        LogTo("ProxyInitWorker: waiting for fresh login; no render gate or late-join replay");
     }
 
     LogTo("ProxyInitWorker: done — proxy fully armed");
