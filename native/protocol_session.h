@@ -19,12 +19,15 @@ struct ProtocolSession {
     bool aFinishedConfiguration = false;
     bool playCodecsReady = false;
 
-    void beginA() {
-        detachB();
+    void beginA(bool preserveB = false) {
+        if (!preserveB || bInbound != Phase::Play || bOutbound != Phase::Play ||
+            waitingStartAck || waitingFinishAck) detachB();
         ++connectionGeneration;
         ++configurationGeneration;
         aPhase = Phase::Login;
         aFinishedConfiguration = playCodecsReady = false;
+        if (preserveB && bInbound == Phase::Play && bOutbound == Phase::Play)
+            waitingStartAck = waitingFinishAck = false;
     }
     void beginConfiguration() {
         ++configurationGeneration;
@@ -33,6 +36,9 @@ struct ProtocolSession {
     }
     static bool mayReplaceDisconnectedB(bool previousChannelActive) {
         return !previousChannelActive;
+    }
+    static bool mayTakeoverB(bool previousChannelActive, bool snapshotReady) {
+        return previousChannelActive && snapshotReady;
     }
     void attachB() {
         ++bGeneration;
@@ -52,11 +58,17 @@ struct ProtocolSession {
         return true;
     }
     bool startConfiguration() {
-        if (bInbound != Phase::Play || bOutbound != Phase::Play || waitingStartAck) return false;
-        waitingStartAck = true;
-        // StartConfiguration is encoded in PLAY; outbound changes after its write.
-        bOutbound = Phase::Configuration;
-        return true;
+        if (waitingStartAck || waitingFinishAck) return false;
+        if (bInbound == Phase::Play && bOutbound == Phase::Play) {
+            waitingStartAck = true;
+            // StartConfiguration is encoded in PLAY; outbound changes after its write.
+            bOutbound = Phase::Configuration;
+            return true;
+        }
+        // A new A generation may supersede B's prior configuration. B is already
+        // using the configuration codec, so no second start packet is legal/needed.
+        return bInbound == Phase::Configuration && bOutbound == Phase::Configuration &&
+               !waitingLoginAck;
     }
     bool configurationAcknowledged() {
         if (!waitingStartAck || bInbound != Phase::Play) return false;

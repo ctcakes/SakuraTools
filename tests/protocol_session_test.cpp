@@ -60,6 +60,46 @@ int main() {
         CHECK(s.finishAcknowledged());
         CHECK(s.active());
     }
+    ProtocolSession ordinary = s;
+    // Ordinary PLAY -> CONFIGURATION is the backend's StartConfiguration path.
+    CHECK(ordinary.startConfiguration());
+    CHECK(ordinary.bInbound == Phase::Play && ordinary.bOutbound == Phase::Configuration);
+    CHECK(ordinary.configurationAcknowledged());
+    CHECK(ordinary.canSendConfiguration());
+    // A later A configuration generation can reuse B's already-installed config codecs.
+    ordinary.beginConfiguration();
+    CHECK(ordinary.startConfiguration());
+    CHECK(ordinary.canSendConfiguration());
+    ordinary.aFinishedConfiguration = ordinary.playCodecsReady = true;
+    ordinary.aPhase = Phase::Play;
+    CHECK(ordinary.finishConfiguration());
+    CHECK(ordinary.finishAcknowledged());
+    CHECK(ordinary.active());
+
+    ProtocolSession midTransition = s;
+    CHECK(midTransition.startConfiguration());
+    midTransition.beginA(true);
+    CHECK(midTransition.bInbound == Phase::Closed && midTransition.bOutbound == Phase::Closed);
+    CHECK(!midTransition.waitingStartAck && !midTransition.configurationAcknowledged());
+
+    ProtocolSession switched = s;
+    switched.beginA(true);
+    CHECK(switched.aPhase == Phase::Login);
+    CHECK(switched.bInbound == Phase::Play && switched.bOutbound == Phase::Play);
+    CHECK(switched.connectionGeneration != s.connectionGeneration);
+    CHECK(!switched.active());
+    switched.beginConfiguration();
+    CHECK(switched.bInbound == Phase::Play && switched.bOutbound == Phase::Play);
+    CHECK(switched.startConfiguration());
+    CHECK(switched.bOutbound == Phase::Configuration && switched.waitingStartAck);
+    CHECK(switched.configurationAcknowledged());
+    CHECK(switched.canSendConfiguration());
+    switched.aFinishedConfiguration = switched.playCodecsReady = true;
+    switched.aPhase = Phase::Play;
+    CHECK(switched.finishConfiguration());
+    CHECK(switched.finishAcknowledged());
+    CHECK(switched.active());
+
     ProtocolSession replacement = s;
     replacement.beginA();
     CHECK(replacement.bInbound == Phase::Closed && replacement.bOutbound == Phase::Closed);
@@ -81,9 +121,13 @@ int main() {
     CHECK(s.connectionGeneration == aConnection && s.configurationGeneration == aConfiguration);
     CHECK(sakura::ProtocolSession::mayReplaceDisconnectedB(false));
     CHECK(!sakura::ProtocolSession::mayReplaceDisconnectedB(true));
+    CHECK(sakura::ProtocolSession::mayTakeoverB(true, true));
+    CHECK(!sakura::ProtocolSession::mayTakeoverB(true, false));
+    CHECK(!sakura::ProtocolSession::mayTakeoverB(false, true));
     s.attachB();
     CHECK(s.bInbound == Phase::Login && s.bOutbound == Phase::Login);
     CHECK(s.connectionGeneration == aConnection && s.configurationGeneration == aConfiguration);
+    // A B disconnect/reconnect does not replace the retained A connection and generations.
     s.disconnectA();
     CHECK(!s.active());
     CHECK(s.aPhase == Phase::Closed && s.bInbound == Phase::Closed && s.bOutbound == Phase::Closed);

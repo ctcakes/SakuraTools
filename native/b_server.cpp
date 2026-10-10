@@ -429,9 +429,25 @@ void JNICALL Native_BSide_channelInactive(JNIEnv* env, jobject, jobject ctx) {
     }
     if (ch) env->DeleteLocalRef(ch);
 }
-void JNICALL Native_BSide_exceptionCaught(JNIEnv* env, jobject, jobject ctx, jobject) {
-    LogTo("BServer: B codec/handler exception; closing only its own channel");
+void JNICALL Native_BSide_exceptionCaught(JNIEnv* env, jobject, jobject ctx, jobject error) {
+    std::lock_guard<std::recursive_mutex> lock(g_bs.mu);
+    const char* stage = "HANDSHAKE";
     jobject ch = channelFor(env, ctx);
+    if (isB(env, ch)) {
+        stage = g_bs.session.bInbound == Phase::Login ? "LOGIN" :
+                g_bs.session.bInbound == Phase::Configuration ? "CONFIGURATION" :
+                g_bs.session.bInbound == Phase::Play ? "PLAY" : "OWNER";
+    }
+    jclass cls = error ? env->GetObjectClass(error) : nullptr;
+    jmethodID toString = cls ? env->GetMethodID(cls, "toString", "()Ljava/lang/String;") : nullptr;
+    jstring text = toString ? (jstring)env->CallObjectMethod(error, toString) : nullptr;
+    const char* message = text ? env->GetStringUTFChars(text, nullptr) : nullptr;
+    LogTo("BServer: B HANDSHAKE stage=%s action=close reason=exception detail=%s",
+          stage, message ? message : "unknown");
+    if (message) env->ReleaseStringUTFChars(text, message);
+    if (text) env->DeleteLocalRef(text);
+    if (cls) env->DeleteLocalRef(cls);
+    if (env->ExceptionCheck()) LogAndClearException(env, "BServer/exceptionCaught");
     closeChannel(env, ch);
     if (ch) env->DeleteLocalRef(ch);
 }
@@ -446,27 +462,45 @@ void JNICALL Native_BSide_channelRead(JNIEnv* env, jobject, jobject ctx, jobject
         jint version = env->CallIntMethod(packet, g_bs.protocolVersion);
         if (status) {
             if (!swapProtocol(env, ch, g_bs.statusOut, false) ||
-                !swapProtocol(env, ch, g_bs.statusIn, true)) closeChannel(env, ch);
+                !swapProtocol(env, ch, g_bs.statusIn, true)) {
+                LogTo("BServer: B HANDSHAKE stage=STATUS action=close reason=codec_transition_failed");
+                closeChannel(env, ch);
+            }
         } else if (version != 772 || !intent ||
                    (!env->IsSameObject(intent, g_bs.loginIntent) && !env->IsSameObject(intent, g_bs.transferIntent))) {
-            LogTo("BServer: rejected login protocol %d (requires 772)", (int)version);
+            LogTo("BServer: B HANDSHAKE stage=HANDSHAKE action=reject reason=invalid_intention_or_protocol version=%d", (int)version);
             closeChannel(env, ch);
         } else {
-            if (g_bs.bChannel && sakura::ProtocolSession::mayReplaceDisconnectedB(
-                    env->CallBooleanMethod(g_bs.bChannel, g_bs.channelActive) == JNI_TRUE)) {
-                LogTo("BServer: reclaiming disconnected B owner before reconnect");
+            bool ownerActive = g_bs.bChannel &&
+                env->CallBooleanMethod(g_bs.bChannel, g_bs.channelActive) == JNI_TRUE;
+            if (g_bs.bChannel && !ownerActive) {
+                LogTo("BServer: B HANDSHAKE stage=LOGIN owner=inactive action=reclaim");
+                detachB(env);
+            }
+            const bool snapshotReady = g_bs.historyComplete &&
+                !(g_bs.session.aPhase == Phase::Play && !g_bs.configurationComplete);
+            const bool takeoverReady = snapshotReady && g_bs.session.aPhase == Phase::Play &&
+                                       g_bs.configurationComplete;
+            if (g_bs.bChannel && sakura::ProtocolSession::mayTakeoverB(ownerActive, takeoverReady)) {
+                LogTo("BServer: B HANDSHAKE stage=LOGIN owner=active action=takeover old_generation=%llu",
+                      (unsigned long long)g_bs.session.bGeneration);
                 detachB(env);
             }
             if (g_bs.bChannel) {
-                LogTo("BServer: rejected additional B connection; current owner unchanged");
+                LogTo("BServer: B HANDSHAKE stage=LOGIN action=reject reason=owner_active_or_unavailable");
                 closeChannel(env, ch);
-            } else if (!g_bs.historyComplete || (g_bs.session.aPhase == Phase::Play && !g_bs.configurationComplete)) {
-                LogTo("BServer: late join rejected: complete configuration/world history unavailable");
+            } else if (!snapshotReady) {
+                LogTo("BServer: B HANDSHAKE stage=LOGIN action=reject reason=snapshot_unavailable history=%d configuration=%d a_phase=%d",
+                      g_bs.historyComplete ? 1 : 0, g_bs.configurationComplete ? 1 : 0,
+                      (int)g_bs.session.aPhase);
                 closeChannel(env, ch);
             } else if (swapProtocol(env, ch, g_bs.loginOut, false) &&
                        swapProtocol(env, ch, g_bs.loginIn, true)) {
                 g_bs.bChannel = env->NewGlobalRef(ch);
                 g_bs.session.attachB();
+                LogTo("BServer: B HANDSHAKE stage=LOGIN action=attached generation=%llu intent=%s",
+                      (unsigned long long)g_bs.session.bGeneration,
+                      env->IsSameObject(intent, g_bs.transferIntent) ? "TRANSFER" : "LOGIN");
                 g_bs.loginSent = false;
                 g_bs.helloReceived = false;
                 g_bs.startPending = false;
@@ -724,7 +758,7 @@ bool bindServer(JNIEnv* env, jobject loader) {
     if (ok) LogTo("BServer: listening on 127.0.0.1:25565, Mojmap 1.21.8 protocol 772");
     return ok;
 }
-void selectA(JNIEnv* env, jobject ctx) {
+void selectA(JNIEnv* env, jobject ctx, bool transfer) {
     jobject ch = channelFor(env, ctx);
     if (!ch) return;
     if (g_bs.aChannel && env->IsSameObject(ch, g_bs.aChannel)) { env->DeleteLocalRef(ch); return; }
@@ -737,13 +771,15 @@ void selectA(JNIEnv* env, jobject ctx) {
     }
     const bool firstA = !g_bs.aChannel && g_bs.session.aPhase == Phase::Closed;
     const bool waitingB = firstA && g_bs.bChannel && g_bs.session.bInbound == Phase::Login && !g_bs.loginSent;
-    if (!waitingB) detachB(env);
+    const bool keepB = g_bs.bChannel && g_bs.session.active() &&
+                       (transfer || g_bs.session.aPhase == Phase::Play);
+    if (!waitingB && !keepB) detachB(env);
     RelayFilter_ClearBypass(env);
     invalidateConfiguration(env);
     drop(env, g_bs.profile);
     drop(env, g_bs.aChannel);
     drop(env, g_bs.aConnection);
-    g_bs.session.beginA();
+    g_bs.session.beginA(keepB);
     if (waitingB) g_bs.session.attachB();
     g_bs.aChannel = env->NewGlobalRef(ch);
     g_bs.aConnection = env->NewGlobalRef(connection);
@@ -790,11 +826,16 @@ void observeA(JNIEnv* env, jobject packet) {
                 g_bs.session.bOutbound == Phase::Play)) {
                 g_bs.startPending = true;
                 schedulePump(env);
-            } else if (g_bs.session.waitingStartAck) {
-                // No configuration has reached B yet; the newest complete generation supersedes it.
+            } else if (g_bs.session.waitingStartAck ||
+                       (g_bs.session.bInbound == Phase::Configuration &&
+                        g_bs.session.bOutbound == Phase::Configuration &&
+                        !g_bs.session.waitingLoginAck)) {
+                // B's configuration codec is already installed; retain it while the newest
+                // A generation is journaled, then replay that generation from its beginning.
+                g_bs.startPending = false;
                 schedulePump(env);
             } else {
-                failB(env, "backend reconfigured while B was still receiving the previous registry generation");
+                failB(env, "backend reconfigured during an unsupported B protocol transition");
             }
         }
         return;
@@ -980,7 +1021,12 @@ void BServer_OnARead(JNIEnv* env, jobject ctx, jobject packet) {
 bool BServer_OnAWrite(JNIEnv* env, jobject ctx, jobject packet) {
     if (!g_bs.bound) return true;
     std::lock_guard<std::recursive_mutex> lock(g_bs.mu);
-    if (BServer_IsLoginIntention(env, packet)) selectA(env, ctx);
+    if (BServer_IsLoginIntention(env, packet)) {
+        jobject intent = env->CallObjectMethod(packet, g_bs.intention);
+        const bool transfer = intent && env->IsSameObject(intent, g_bs.transferIntent);
+        if (intent) env->DeleteLocalRef(intent);
+        selectA(env, ctx, transfer);
+    }
     if (!isA(env, ctx)) return true;
     std::string name = packetName(env, packet);
     if (ends(name, ".ServerboundLoginAcknowledgedPacket")) {
