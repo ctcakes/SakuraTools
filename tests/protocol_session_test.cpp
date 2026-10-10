@@ -48,6 +48,7 @@ int main() {
         CHECK(s.startConfiguration());
         CHECK(s.bInbound == Phase::Play && s.bOutbound == Phase::Configuration);
         CHECK(!s.canSendConfiguration());
+        CHECK(!s.canStartConfiguration());
         CHECK(!s.startConfiguration());
         CHECK(!s.finishConfiguration());
         CHECK(s.configurationAcknowledged());
@@ -60,7 +61,16 @@ int main() {
         CHECK(s.finishAcknowledged());
         CHECK(s.active());
     }
+    ProtocolSession finishPending = s;
+    finishPending.bInbound = Phase::Configuration;
+    finishPending.bOutbound = Phase::Play;
+    finishPending.waitingFinishAck = true;
+    CHECK(!finishPending.canStartConfiguration());
+    CHECK(!finishPending.startConfiguration());
+    CHECK(finishPending.bOutbound == Phase::Play && finishPending.waitingFinishAck);
+
     ProtocolSession ordinary = s;
+    CHECK(ordinary.canStartConfiguration());
     // Ordinary PLAY -> CONFIGURATION is the backend's StartConfiguration path.
     CHECK(ordinary.startConfiguration());
     CHECK(ordinary.bInbound == Phase::Play && ordinary.bOutbound == Phase::Configuration);

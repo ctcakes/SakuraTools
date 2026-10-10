@@ -49,6 +49,7 @@ struct BServer {
     bool loginSent = false;
     bool helloReceived = false;
     bool startPending = false;
+    bool bWorldInitialized = false;
     size_t configCursor = 0;
     jobject aChannel = nullptr;
     jobject aConnection = nullptr;
@@ -69,6 +70,7 @@ struct BServer {
     jobject transferIntent = nullptr;
     jobject statusIntent = nullptr;
     jobject finish = nullptr;
+    jobject startConfigurationPacket = nullptr;
     std::vector<PacketRef> configuration;
     std::deque<PacketRef> play;
     std::vector<PacketRef> history;
@@ -80,7 +82,7 @@ struct BServer {
     jclass initClass = nullptr, handlerClass = nullptr, taskClass = nullptr;
     jmethodID initCtor = nullptr, handlerCtor = nullptr, taskCtor = nullptr;
     jclass connectionClass = nullptr, encoderClass = nullptr, decoderClass = nullptr;
-    jclass intentClass = nullptr, loginFinishedClass = nullptr, startClass = nullptr;
+    jclass intentClass = nullptr, loginFinishedClass = nullptr;
     jclass keepAliveClass = nullptr, pongClass = nullptr;
     jclass clientPacksClass = nullptr, serverPacksClass = nullptr, registryClass = nullptr;
     jclass listClass = nullptr, entryClass = nullptr;
@@ -89,13 +91,15 @@ struct BServer {
     jmethodID registryEntries = nullptr, entryData = nullptr, optionalPresent = nullptr;
     jmethodID configure = nullptr, send = nullptr, encoderCtor = nullptr, decoderCtor = nullptr;
     jmethodID channel = nullptr, pipeline = nullptr, write = nullptr, close = nullptr;
-    jmethodID futureDone = nullptr, futureSuccess = nullptr;
+    jmethodID futureDone = nullptr, futureSuccess = nullptr, futureCause = nullptr, futureAddListener = nullptr;
+    jclass channelFutureListenerClass = nullptr;
+    jfieldID closeOnFailure = nullptr;
     jmethodID channelActive = nullptr;
     jmethodID addLast = nullptr, getHandler = nullptr, replace = nullptr;
     jmethodID eventLoop = nullptr, execute = nullptr, config = nullptr, autoRead = nullptr;
     jfieldID encoderProtocol = nullptr, decoderProtocol = nullptr;
     jmethodID intention = nullptr, protocolVersion = nullptr, profileAccessor = nullptr;
-    jmethodID loginFinishedCtor = nullptr, startCtor = nullptr, keepAliveCtor = nullptr, pongCtor = nullptr;
+    jmethodID loginFinishedCtor = nullptr, keepAliveCtor = nullptr, pongCtor = nullptr;
     jclass statusResponseClass = nullptr, serverStatusClass = nullptr, versionClass = nullptr;
     jclass componentClass = nullptr, optionalClass = nullptr;
     jmethodID statusResponseCtor = nullptr, serverStatusCtor = nullptr, versionCtor = nullptr;
@@ -148,6 +152,7 @@ void detachB(JNIEnv* env) {
     g_bs.loginSent = false;
     g_bs.helloReceived = false;
     g_bs.startPending = false;
+    g_bs.bWorldInitialized = false;
     g_bs.configCursor = 0;
     g_bs.registries.attachB();
     clearPlay(env);
@@ -166,6 +171,7 @@ void invalidateConfiguration(JNIEnv* env) {
     drop(env, g_bs.aPlayInbound);
     drop(env, g_bs.aPlayOutbound);
     g_bs.configurationComplete = false;
+    g_bs.bWorldInitialized = false;
     g_bs.registries.beginConfiguration();
     g_bs.historyComplete = true;
     g_bs.configCursor = 0;
@@ -217,14 +223,115 @@ bool swapProtocol(JNIEnv* env, jobject ch, jobject protocol, bool inbound) {
     }
     return ok;
 }
+std::string throwableText(JNIEnv* env, jthrowable error) {
+    if (env->ExceptionCheck()) return "unknown (JNI exception pending)";
+    if (!error) return "unknown";
+    std::string result;
+    jthrowable seen[8] = {};
+    int count = 0;
+    jthrowable current = (jthrowable)env->NewLocalRef(error);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return "unknown"; }
+    while (current && count < 8) {
+        seen[count++] = current;
+        std::string detail = "unknown";
+        jclass cls = env->GetObjectClass(current);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); cls = nullptr; }
+        jmethodID toString = cls ? env->GetMethodID(cls, "toString", "()Ljava/lang/String;") : nullptr;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); toString = nullptr; }
+        jstring text = toString ? (jstring)env->CallObjectMethod(current, toString) : nullptr;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); text = nullptr; }
+        const char* chars = text ? env->GetStringUTFChars(text, nullptr) : nullptr;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); chars = nullptr; }
+        if (chars) {
+            detail = chars;
+            env->ReleaseStringUTFChars(text, chars);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        if (text) env->DeleteLocalRef(text);
+        jmethodID getCause = cls ? env->GetMethodID(cls, "getCause", "()Ljava/lang/Throwable;") : nullptr;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); getCause = nullptr; }
+        jthrowable cause = getCause ? (jthrowable)env->CallObjectMethod(current, getCause) : nullptr;
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            if (cause) env->DeleteLocalRef(cause);
+            cause = nullptr;
+        }
+        if (cls) env->DeleteLocalRef(cls);
+        if (!result.empty()) result += " <- caused by: ";
+        result += detail;
+        bool cycle = false;
+        for (int i = 0; cause && i < count; ++i)
+            if (env->IsSameObject(cause, seen[i])) { cycle = true; break; }
+        if (cycle || (cause && count == 8)) {
+            result += cycle ? " <- [cause cycle]" : " <- [cause depth limit]";
+            env->DeleteLocalRef(cause);
+            cause = nullptr;
+        }
+        current = cause;
+    }
+    for (int i = 0; i < count; ++i) env->DeleteLocalRef(seen[i]);
+    return result.empty() ? "unknown" : result;
+}
 bool writePacket(JNIEnv* env, jobject ch, jobject packet) {
     jobject future = env->CallObjectMethod(ch, g_bs.write, packet);
-    bool ok = future && !env->ExceptionCheck();
-    if (ok && env->CallBooleanMethod(future, g_bs.futureDone) &&
-        !env->CallBooleanMethod(future, g_bs.futureSuccess)) ok = false;
-    if (env->ExceptionCheck()) { LogAndClearException(env, "BServer/write"); ok = false; }
-    if (future) env->DeleteLocalRef(future);
-    return ok;
+    if (env->ExceptionCheck()) {
+        jthrowable error = env->ExceptionOccurred();
+        env->ExceptionClear();
+        const std::string detail = throwableText(env, error);
+        LogTo("BServer: synchronous write exception packet=%s detail=%s",
+              packetName(env, packet).c_str(), detail.c_str());
+        if (error) env->DeleteLocalRef(error);
+        if (future) env->DeleteLocalRef(future);
+        return false;
+    }
+    if (!future) {
+        LogTo("BServer: write returned null ChannelFuture packet=%s", packetName(env, packet).c_str());
+        return false;
+    }
+    const bool done = env->CallBooleanMethod(future, g_bs.futureDone) == JNI_TRUE;
+    bool success = false;
+    std::string cause = done ? "none" : "pending";
+    if (env->ExceptionCheck()) {
+        LogAndClearException(env, "BServer/write future inspection");
+        cause = "future inspection exception";
+    } else if (done) {
+        success = env->CallBooleanMethod(future, g_bs.futureSuccess) == JNI_TRUE;
+        if (!success && !env->ExceptionCheck()) {
+            jobject error = env->CallObjectMethod(future, g_bs.futureCause);
+            if (env->ExceptionCheck()) {
+                LogAndClearException(env, "BServer/write future cause");
+                cause = "future cause inspection exception";
+            } else {
+                cause = throwableText(env, (jthrowable)error);
+            }
+            if (error) env->DeleteLocalRef(error);
+        }
+        if (env->ExceptionCheck()) {
+            LogAndClearException(env, "BServer/write future success");
+            cause = "future success inspection exception";
+        }
+    } else {
+        // Netty encodes the write on this EventLoop; its listener handles a later failure.
+        jobject closeOnFailure = env->GetStaticObjectField(g_bs.channelFutureListenerClass,
+                                                            g_bs.closeOnFailure);
+        if (closeOnFailure && !env->ExceptionCheck()) {
+            jobject listenerFuture = env->CallObjectMethod(future, g_bs.futureAddListener, closeOnFailure);
+            if (listenerFuture) env->DeleteLocalRef(listenerFuture);
+        }
+        if (env->ExceptionCheck()) {
+            LogAndClearException(env, "BServer/write failure listener");
+            cause = "cannot register asynchronous failure listener";
+        }
+        if (closeOnFailure) env->DeleteLocalRef(closeOnFailure);
+        // This means accepted by Netty, not completed successfully; CLOSE_ON_FAILURE
+        // closes the channel if the asynchronous write later fails.
+        success = cause == "pending";
+    }
+    if (!success)
+        LogTo("BServer: ChannelFuture write failed packet=%s done=%d success=%d cause=%s",
+              packetName(env, packet).c_str(), done ? 1 : 0, success ? 1 : 0, cause.c_str());
+    env->DeleteLocalRef(future);
+    return success;
 }
 void capturePlayCodecs(JNIEnv* env) {
     if (!g_bs.aChannel || g_bs.session.aPhase != Phase::Play) return;
@@ -351,11 +458,48 @@ void pump(JNIEnv* env) {
         g_bs.loginSent = true;
     }
     if (g_bs.startPending && g_bs.session.bInbound == Phase::Play && !g_bs.session.waitingFinishAck) {
-        jobject start = env->NewObject(g_bs.startClass, g_bs.startCtor);
-        bool ok = start && writePacket(env, g_bs.bChannel, start) &&
-                  swapProtocol(env, g_bs.bChannel, g_bs.configOut, false);
-        if (start) env->DeleteLocalRef(start);
-        if (!ok || !g_bs.session.startConfiguration()) { failB(env, "start-configuration transition failed"); return; }
+        const auto& session = g_bs.session;
+        if (!session.canStartConfiguration()) {
+            LogTo("BServer: start-configuration rejected stage=state_predicate a=%d b_in=%d b_out=%d login_ack=%d start_ack=%d finish_ack=%d",
+                  (int)session.aPhase, (int)session.bInbound, (int)session.bOutbound,
+                  session.waitingLoginAck ? 1 : 0, session.waitingStartAck ? 1 : 0,
+                  session.waitingFinishAck ? 1 : 0);
+            failB(env, "start-configuration state predicate failed"); return;
+        }
+        jobject start = env->NewLocalRef(g_bs.startConfigurationPacket);
+        if (!start || env->ExceptionCheck()) {
+            if (env->ExceptionCheck()) LogAndClearException(env, "BServer/start-configuration create");
+            LogTo("BServer: start-configuration failed stage=packet_creation a=%d b_in=%d b_out=%d login_ack=%d start_ack=%d finish_ack=%d",
+                  (int)session.aPhase, (int)session.bInbound, (int)session.bOutbound,
+                  session.waitingLoginAck ? 1 : 0, session.waitingStartAck ? 1 : 0,
+                  session.waitingFinishAck ? 1 : 0);
+            if (start) env->DeleteLocalRef(start);
+            failB(env, "start-configuration packet creation failed"); return;
+        }
+        if (!writePacket(env, g_bs.bChannel, start)) {
+            env->DeleteLocalRef(start);
+            LogTo("BServer: start-configuration failed stage=packet_write a=%d b_in=%d b_out=%d login_ack=%d start_ack=%d finish_ack=%d",
+                  (int)session.aPhase, (int)session.bInbound, (int)session.bOutbound,
+                  session.waitingLoginAck ? 1 : 0, session.waitingStartAck ? 1 : 0,
+                  session.waitingFinishAck ? 1 : 0);
+            failB(env, "start-configuration packet write failed"); return;
+        }
+        if (!swapProtocol(env, g_bs.bChannel, g_bs.configOut, false)) {
+            env->DeleteLocalRef(start);
+            LogTo("BServer: start-configuration failed stage=codec_swap a=%d b_in=%d b_out=%d login_ack=%d start_ack=%d finish_ack=%d",
+                  (int)session.aPhase, (int)session.bInbound, (int)session.bOutbound,
+                  session.waitingLoginAck ? 1 : 0, session.waitingStartAck ? 1 : 0,
+                  session.waitingFinishAck ? 1 : 0);
+            failB(env, "start-configuration codec swap failed"); return;
+        }
+        env->DeleteLocalRef(start);
+        if (!g_bs.session.startConfiguration()) {
+            LogTo("BServer: start-configuration rejected stage=state_commit a=%d b_in=%d b_out=%d login_ack=%d start_ack=%d finish_ack=%d",
+                  (int)session.aPhase, (int)session.bInbound, (int)session.bOutbound,
+                  session.waitingLoginAck ? 1 : 0, session.waitingStartAck ? 1 : 0,
+                  session.waitingFinishAck ? 1 : 0);
+            failB(env, "start-configuration state commit failed"); return;
+        }
         g_bs.startPending = false;
     }
     if (g_bs.session.canSendConfiguration() && g_bs.registries.canReplay()) {
@@ -387,6 +531,8 @@ void pump(JNIEnv* env) {
             bool current = p.connection == g_bs.session.connectionGeneration &&
                            p.configuration == g_bs.session.configurationGeneration;
             bool ok = !current || writePacket(env, g_bs.bChannel, p.packet);
+            if (current && ok && ends(packetName(env, p.packet), ".ClientboundLoginPacket"))
+                g_bs.bWorldInitialized = true;
             env->DeleteGlobalRef(p.packet);
             if (!ok) { failB(env, "play write failed"); return; }
         }
@@ -438,16 +584,9 @@ void JNICALL Native_BSide_exceptionCaught(JNIEnv* env, jobject, jobject ctx, job
                 g_bs.session.bInbound == Phase::Configuration ? "CONFIGURATION" :
                 g_bs.session.bInbound == Phase::Play ? "PLAY" : "OWNER";
     }
-    jclass cls = error ? env->GetObjectClass(error) : nullptr;
-    jmethodID toString = cls ? env->GetMethodID(cls, "toString", "()Ljava/lang/String;") : nullptr;
-    jstring text = toString ? (jstring)env->CallObjectMethod(error, toString) : nullptr;
-    const char* message = text ? env->GetStringUTFChars(text, nullptr) : nullptr;
+    const std::string detail = throwableText(env, (jthrowable)error);
     LogTo("BServer: B HANDSHAKE stage=%s action=close reason=exception detail=%s",
-          stage, message ? message : "unknown");
-    if (message) env->ReleaseStringUTFChars(text, message);
-    if (text) env->DeleteLocalRef(text);
-    if (cls) env->DeleteLocalRef(cls);
-    if (env->ExceptionCheck()) LogAndClearException(env, "BServer/exceptionCaught");
+          stage, detail.c_str());
     closeChannel(env, ch);
     if (ch) env->DeleteLocalRef(ch);
 }
@@ -498,11 +637,12 @@ void JNICALL Native_BSide_channelRead(JNIEnv* env, jobject, jobject ctx, jobject
                        swapProtocol(env, ch, g_bs.loginIn, true)) {
                 g_bs.bChannel = env->NewGlobalRef(ch);
                 g_bs.session.attachB();
-                LogTo("BServer: B HANDSHAKE stage=LOGIN action=attached generation=%llu intent=%s",
-                      (unsigned long long)g_bs.session.bGeneration,
+                LogTo("BServer: B HANDSHAKE stage=LOGIN action=attached version=%d generation=%llu intent=%s",
+                      (int)version, (unsigned long long)g_bs.session.bGeneration,
                       env->IsSameObject(intent, g_bs.transferIntent) ? "TRANSFER" : "LOGIN");
                 g_bs.loginSent = false;
                 g_bs.helloReceived = false;
+                g_bs.bWorldInitialized = false;
                 g_bs.startPending = false;
                 g_bs.configCursor = 0;
                 g_bs.registries.attachB();
@@ -655,6 +795,16 @@ bool cacheJavaRefs(JNIEnv* env, jobject loader) {
     jclass future = cls("io.netty.util.concurrent.Future");
     g_bs.futureDone = method(future, "isDone", "()Z");
     g_bs.futureSuccess = method(future, "isSuccess", "()Z");
+    g_bs.futureCause = method(future, "cause", "()Ljava/lang/Throwable;");
+    g_bs.futureAddListener = method(future, "addListener", "(Lio/netty/util/concurrent/GenericFutureListener;)Lio/netty/util/concurrent/Future;");
+    g_bs.channelFutureListenerClass = cls("io.netty.channel.ChannelFutureListener");
+    g_bs.closeOnFailure = g_bs.channelFutureListenerClass
+        ? env->GetStaticFieldID(g_bs.channelFutureListenerClass, "CLOSE_ON_FAILURE", "Lio/netty/channel/ChannelFutureListener;") : nullptr;
+    if (!g_bs.closeOnFailure) {
+        LogTo("BServer: missing ChannelFutureListener.CLOSE_ON_FAILURE binding");
+        ok = false;
+        if (env->ExceptionCheck()) LogAndClearException(env, "BServer/failure listener binding");
+    }
     g_bs.channelActive = method(channel, "isActive", "()Z");
     g_bs.channel = method(ctx, "channel", "()Lio/netty/channel/Channel;");
     g_bs.pipeline = method(channel, "pipeline", "()Lio/netty/channel/ChannelPipeline;");
@@ -685,8 +835,8 @@ bool cacheJavaRefs(JNIEnv* env, jobject loader) {
     g_bs.loginFinishedClass = cls("net.minecraft.network.protocol.login.ClientboundLoginFinishedPacket");
     g_bs.loginFinishedCtor = method(g_bs.loginFinishedClass, "<init>", "(Lcom/mojang/authlib/GameProfile;)V");
     g_bs.profileAccessor = method(g_bs.loginFinishedClass, "gameProfile", "()Lcom/mojang/authlib/GameProfile;");
-    g_bs.startClass = cls("net.minecraft.network.protocol.game.ClientboundStartConfigurationPacket");
-    g_bs.startCtor = method(g_bs.startClass, "<init>", "()V");
+    g_bs.startConfigurationPacket = staticObject("net.minecraft.network.protocol.game.ClientboundStartConfigurationPacket",
+        "INSTANCE", "Lnet/minecraft/network/protocol/game/ClientboundStartConfigurationPacket;");
     g_bs.keepAliveClass = cls("net.minecraft.network.protocol.common.ClientboundKeepAlivePacket");
     g_bs.keepAliveCtor = method(g_bs.keepAliveClass, "<init>", "(J)V");
     g_bs.pongClass = cls("net.minecraft.network.protocol.ping.ClientboundPongResponsePacket");
@@ -901,10 +1051,25 @@ void observeA(JNIEnv* env, jobject packet) {
         clearPackets(env, g_bs.history);
         g_bs.historyComplete = false;
         g_cache.clear(env);
-        // Active B consumes the ordered respawn normally; a new B cannot bootstrap from old-world packets.
-        if (g_bs.bChannel && !g_bs.session.active()) {
-            clearPlay(env);
-            failB(env, "world changed before B finished initial world bootstrap");
+        // Respawn requires Login's world/player context, not a completed configuration ACK.
+        if (g_bs.bChannel) {
+            bool bootstrapReady = g_bs.bWorldInitialized;
+            for (const auto& p : g_bs.play) {
+                if (p.connection == g_bs.session.connectionGeneration &&
+                    p.configuration == g_bs.session.configurationGeneration &&
+                    ends(packetName(env, p.packet), ".ClientboundLoginPacket")) {
+                    bootstrapReady = true;
+                    break;
+                }
+            }
+            if (!bootstrapReady) {
+                failB(env, "world changed without an ordered B world bootstrap");
+                return;
+            }
+            LogTo("BServer: retaining ordered respawn bootstrap=%s a=%d b_in=%d b_out=%d finish_ack=%d backlog=%llu",
+                  g_bs.bWorldInitialized ? "written" : "queued", (int)g_bs.session.aPhase,
+                  (int)g_bs.session.bInbound, (int)g_bs.session.bOutbound,
+                  g_bs.session.waitingFinishAck ? 1 : 0, (unsigned long long)g_bs.play.size());
         }
     }
     if (!prefix(name, "net.minecraft.network.protocol.game.") &&

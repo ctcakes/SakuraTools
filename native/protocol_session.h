@@ -57,18 +57,21 @@ struct ProtocolSession {
         bInbound = Phase::Configuration;
         return true;
     }
-    bool startConfiguration() {
+    bool canStartConfiguration() const {
         if (waitingStartAck || waitingFinishAck) return false;
-        if (bInbound == Phase::Play && bOutbound == Phase::Play) {
+        return (bInbound == Phase::Play && bOutbound == Phase::Play) ||
+               (bInbound == Phase::Configuration && bOutbound == Phase::Configuration &&
+                !waitingLoginAck);
+    }
+    bool startConfiguration() {
+        if (!canStartConfiguration()) return false;
+        if (bInbound == Phase::Play) {
             waitingStartAck = true;
             // StartConfiguration is encoded in PLAY; outbound changes after its write.
             bOutbound = Phase::Configuration;
-            return true;
         }
-        // A new A generation may supersede B's prior configuration. B is already
-        // using the configuration codec, so no second start packet is legal/needed.
-        return bInbound == Phase::Configuration && bOutbound == Phase::Configuration &&
-               !waitingLoginAck;
+        // An already-configuring B needs no duplicate start packet.
+        return true;
     }
     bool configurationAcknowledged() {
         if (!waitingStartAck || bInbound != Phase::Play) return false;
