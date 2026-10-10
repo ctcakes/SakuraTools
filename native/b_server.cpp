@@ -562,14 +562,47 @@ void sendStatus(JNIEnv* env, jobject ch) {
                          versionOptional, status, packet }) if (ref) env->DeleteLocalRef(ref);
 }
 void JNICALL Native_BSide_channelActive(JNIEnv*, jobject, jobject) {}
+bool hasCapturedAPlayBootstrap(JNIEnv* env) {
+    if (!g_bs.aChannel || !g_bs.aConnection || !g_bs.configurationComplete ||
+        !g_bs.historyComplete || g_bs.session.aPhase != Phase::Play ||
+        env->CallBooleanMethod(g_bs.aChannel, g_bs.channelActive) != JNI_TRUE ||
+        env->ExceptionCheck()) {
+        if (env->ExceptionCheck()) LogAndClearException(env, "BServer/A snapshot readiness");
+        return false;
+    }
+    for (const auto& p : g_bs.history) {
+        if (p.connection == g_bs.session.connectionGeneration &&
+            p.configuration == g_bs.session.configurationGeneration &&
+            ends(packetName(env, p.packet), ".ClientboundLoginPacket")) return true;
+    }
+    return false;
+}
 void JNICALL Native_BSide_channelInactive(JNIEnv* env, jobject, jobject ctx) {
     std::lock_guard<std::recursive_mutex> lock(g_bs.mu);
     jobject ch = channelFor(env, ctx);
     if (isB(env, ch)) {
-        LogTo("BServer: B channel inactive; releasing owner and retaining A configuration snapshot");
+        const bool midSession = hasCapturedAPlayBootstrap(env);
+        jobject aChannel = g_bs.aChannel ? env->NewLocalRef(g_bs.aChannel) : nullptr;
+        jobject aConnection = g_bs.aConnection ? env->NewLocalRef(g_bs.aConnection) : nullptr;
+        LogTo("BServer: B channel inactive; releasing owner mid_session=%d a=%d config=%d history=%d",
+              midSession ? 1 : 0, aChannel && aConnection ? 1 : 0,
+              g_bs.configurationComplete ? 1 : 0, g_bs.historyComplete ? 1 : 0);
         detachB(env);
-        // B lifecycle never closes the independently owned backend A connection.
         RelayFilter_ClearBypass(env);
+        const bool stillOwnedA = aChannel && aConnection && g_bs.aChannel && g_bs.aConnection &&
+            env->IsSameObject(aChannel, g_bs.aChannel) &&
+            env->IsSameObject(aConnection, g_bs.aConnection) &&
+            env->CallBooleanMethod(aChannel, g_bs.channelActive) == JNI_TRUE && !env->ExceptionCheck();
+        if (!midSession && stillOwnedA) {
+            // Netty Channel.close() is thread-safe and schedules close on the channel EventLoop.
+            LogTo("BServer: closing current A backend channel to trigger the client's reconnect workflow");
+            closeChannel(env, aChannel);
+        } else if (!midSession) {
+            if (env->ExceptionCheck()) LogAndClearException(env, "BServer/A close ownership check");
+            LogTo("BServer: not closing A backend channel; current ownership/activity could not be confirmed");
+        }
+        if (aChannel) env->DeleteLocalRef(aChannel);
+        if (aConnection) env->DeleteLocalRef(aConnection);
     } else if (ch) {
         LogTo("BServer: ignored inactive callback from non-owner B channel");
     }
