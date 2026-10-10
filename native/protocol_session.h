@@ -31,6 +31,9 @@ struct ProtocolSession {
         aPhase = Phase::Configuration;
         aFinishedConfiguration = playCodecsReady = false;
     }
+    static bool mayReplaceDisconnectedB(bool previousChannelActive) {
+        return !previousChannelActive;
+    }
     void attachB() {
         ++bGeneration;
         bInbound = bOutbound = Phase::Login;

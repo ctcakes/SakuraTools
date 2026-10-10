@@ -52,4 +52,22 @@ run(['cl', '/nologo', '/EHsc', '/std:c++17', '/I' + str(MUTANT),
      ROOT / 'tests/b_chat_route_test.cpp', '/Fe:' + str(MUTANT / 'b_chat_route_mutant.exe'),
      '/Fo:' + str(MUTANT / 'b_chat_route_mutant.obj')])
 run([MUTANT / 'b_chat_route_mutant.exe'], negative=True)
-print('Windows verification and all three negative controls passed', flush=True)
+run([BUILD / 'registry_replay_test.exe'])
+registry_header = (ROOT / 'native/registry_replay.h').read_text(encoding='utf-8')
+needle = '        return 0;'
+if registry_header.count(needle) != 1:
+    raise RuntimeError('upstream pack policy changed; review negative control')
+(MUTANT / 'registry_replay.h').write_text(registry_header.replace(needle, '        return requested;'), encoding='utf-8')
+run(['cl', '/nologo', '/EHsc', '/std:c++17', '/I' + str(MUTANT), '/I' + str(ROOT / 'native'),
+     ROOT / 'tests/registry_replay_test.cpp', '/Fe:' + str(MUTANT / 'registry_replay_mutant.exe'),
+     '/Fo:' + str(MUTANT / 'registry_replay_mutant.obj')])
+run([MUTANT / 'registry_replay_mutant.exe'], negative=True)
+needle = 'return requested != 0;'
+if registry_header.count(needle) != 1:
+    raise RuntimeError('known-packs replacement guard changed; review negative control')
+(MUTANT / 'registry_replay.h').write_text(registry_header.replace(needle, 'return false;'), encoding='utf-8')
+run(['cl', '/nologo', '/EHsc', '/std:c++17', '/I' + str(MUTANT), '/I' + str(ROOT / 'native'),
+     ROOT / 'tests/registry_replay_test.cpp', '/Fe:' + str(MUTANT / 'registry_route_mutant.exe'),
+     '/Fo:' + str(MUTANT / 'registry_route_mutant.obj')])
+run([MUTANT / 'registry_route_mutant.exe'], negative=True)
+print('Windows verification and all five negative controls passed', flush=True)

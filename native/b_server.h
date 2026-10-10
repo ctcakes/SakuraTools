@@ -14,5 +14,7 @@ bool BServer_TryCaptureLiveConnection(JNIEnv* env);
 void BServer_OnARead(JNIEnv* env, jobject ctx, jobject packet);
 // true: allow the original A write; false: consume and complete its promise.
 bool BServer_OnAWrite(JNIEnv* env, jobject ctx, jobject packet);
+// Returns the borrowed original or a new local reference for this wire write only.
+jobject BServer_PrepareAWrite(JNIEnv* env, jobject ctx, jobject packet);
 void BServer_OnAInactive(JNIEnv* env, jobject ctx);
 bool BServer_ShouldRoutePlayerPacket(const char* className);

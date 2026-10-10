@@ -4,6 +4,7 @@
 #include "random_name.h"
 #include "relay_handler.h"
 #include "protocol_session.h"
+#include "registry_replay.h"
 #include "world_cache.h"
 
 #include <atomic>
@@ -41,6 +42,7 @@ struct ChatTask {
 struct BServer {
     std::recursive_mutex mu;
     sakura::ProtocolSession session;
+    sakura::RegistryReplay registries;
     std::atomic_bool bound{false};
     bool configurationComplete = false;
     bool historyComplete = true;
@@ -80,9 +82,15 @@ struct BServer {
     jclass connectionClass = nullptr, encoderClass = nullptr, decoderClass = nullptr;
     jclass intentClass = nullptr, loginFinishedClass = nullptr, startClass = nullptr;
     jclass keepAliveClass = nullptr, pongClass = nullptr;
+    jclass clientPacksClass = nullptr, serverPacksClass = nullptr, registryClass = nullptr;
+    jclass listClass = nullptr, entryClass = nullptr;
+    jmethodID clientPacksCtor = nullptr, serverPacksCtor = nullptr, knownPacks = nullptr;
+    jmethodID emptyList = nullptr, listSize = nullptr, listGet = nullptr;
+    jmethodID registryEntries = nullptr, entryData = nullptr, optionalPresent = nullptr;
     jmethodID configure = nullptr, send = nullptr, encoderCtor = nullptr, decoderCtor = nullptr;
     jmethodID channel = nullptr, pipeline = nullptr, write = nullptr, close = nullptr;
     jmethodID futureDone = nullptr, futureSuccess = nullptr;
+    jmethodID channelActive = nullptr;
     jmethodID addLast = nullptr, getHandler = nullptr, replace = nullptr;
     jmethodID eventLoop = nullptr, execute = nullptr, config = nullptr, autoRead = nullptr;
     jfieldID encoderProtocol = nullptr, decoderProtocol = nullptr;
@@ -141,6 +149,8 @@ void detachB(JNIEnv* env) {
     g_bs.helloReceived = false;
     g_bs.startPending = false;
     g_bs.configCursor = 0;
+    g_bs.registries.attachB();
+    clearPlay(env);
     closeChannel(env, ch);
     if (ch) env->DeleteLocalRef(ch);
 }
@@ -156,6 +166,7 @@ void invalidateConfiguration(JNIEnv* env) {
     drop(env, g_bs.aPlayInbound);
     drop(env, g_bs.aPlayOutbound);
     g_bs.configurationComplete = false;
+    g_bs.registries.beginConfiguration();
     g_bs.historyComplete = true;
     g_bs.configCursor = 0;
     g_cache.clear(env);
@@ -347,12 +358,16 @@ void pump(JNIEnv* env) {
         if (!ok || !g_bs.session.startConfiguration()) { failB(env, "start-configuration transition failed"); return; }
         g_bs.startPending = false;
     }
-    if (g_bs.session.canSendConfiguration()) {
+    if (g_bs.session.canSendConfiguration() && g_bs.registries.canReplay()) {
         while (g_bs.configCursor < g_bs.configuration.size()) {
             const PacketRef& p = g_bs.configuration[g_bs.configCursor++];
             if (p.connection != g_bs.session.connectionGeneration ||
                 p.configuration != g_bs.session.configurationGeneration) continue;
             if (!writePacket(env, g_bs.bChannel, p.packet)) { failB(env, "configuration write failed"); return; }
+            if (env->IsInstanceOf(p.packet, g_bs.clientPacksClass)) {
+                if (!g_bs.registries.offerB()) { failB(env, "overlapping known-packs offer"); return; }
+                return;
+            }
         }
         capturePlayCodecs(env);
         if (g_bs.finish && g_bs.session.aFinishedConfiguration && g_bs.session.playCodecsReady) {
@@ -405,16 +420,12 @@ void JNICALL Native_BSide_channelInactive(JNIEnv* env, jobject, jobject ctx) {
     std::lock_guard<std::recursive_mutex> lock(g_bs.mu);
     jobject ch = channelFor(env, ctx);
     if (isB(env, ch)) {
-        drop(env, g_bs.bChannel);
-        drop(env, g_bs.bPendingPlayInbound);
-        g_bs.session.detachB();
-        g_bs.loginSent = false;
-    g_bs.helloReceived = false;
-        g_bs.startPending = false;
-        g_bs.configCursor = 0;
-        clearPlay(env);
+        LogTo("BServer: B channel inactive; releasing owner and retaining A configuration snapshot");
+        detachB(env);
         // B lifecycle never closes the independently owned backend A connection.
         RelayFilter_ClearBypass(env);
+    } else if (ch) {
+        LogTo("BServer: ignored inactive callback from non-owner B channel");
     }
     if (ch) env->DeleteLocalRef(ch);
 }
@@ -440,24 +451,33 @@ void JNICALL Native_BSide_channelRead(JNIEnv* env, jobject, jobject ctx, jobject
                    (!env->IsSameObject(intent, g_bs.loginIntent) && !env->IsSameObject(intent, g_bs.transferIntent))) {
             LogTo("BServer: rejected login protocol %d (requires 772)", (int)version);
             closeChannel(env, ch);
-        } else if (g_bs.bChannel) {
-            LogTo("BServer: rejected additional B connection; current owner unchanged");
-            closeChannel(env, ch);
-        } else if (!g_bs.historyComplete || (g_bs.session.aPhase == Phase::Play && !g_bs.configurationComplete)) {
-            LogTo("BServer: late join rejected: complete configuration/world history unavailable");
-            closeChannel(env, ch);
-        } else if (swapProtocol(env, ch, g_bs.loginOut, false) &&
-                   swapProtocol(env, ch, g_bs.loginIn, true)) {
-            g_bs.bChannel = env->NewGlobalRef(ch);
-            g_bs.session.attachB();
-            g_bs.loginSent = false;
-    g_bs.helloReceived = false;
-            g_bs.configCursor = 0;
-            g_bs.lastKeepAlive = std::chrono::steady_clock::now();
-            clearPlay(env);
-            for (const auto& p : g_bs.history)
-                g_bs.play.push_back({env->NewGlobalRef(p.packet), p.connection, p.configuration});
-        } else closeChannel(env, ch);
+        } else {
+            if (g_bs.bChannel && sakura::ProtocolSession::mayReplaceDisconnectedB(
+                    env->CallBooleanMethod(g_bs.bChannel, g_bs.channelActive) == JNI_TRUE)) {
+                LogTo("BServer: reclaiming disconnected B owner before reconnect");
+                detachB(env);
+            }
+            if (g_bs.bChannel) {
+                LogTo("BServer: rejected additional B connection; current owner unchanged");
+                closeChannel(env, ch);
+            } else if (!g_bs.historyComplete || (g_bs.session.aPhase == Phase::Play && !g_bs.configurationComplete)) {
+                LogTo("BServer: late join rejected: complete configuration/world history unavailable");
+                closeChannel(env, ch);
+            } else if (swapProtocol(env, ch, g_bs.loginOut, false) &&
+                       swapProtocol(env, ch, g_bs.loginIn, true)) {
+                g_bs.bChannel = env->NewGlobalRef(ch);
+                g_bs.session.attachB();
+                g_bs.loginSent = false;
+                g_bs.helloReceived = false;
+                g_bs.startPending = false;
+                g_bs.configCursor = 0;
+                g_bs.registries.attachB();
+                g_bs.lastKeepAlive = std::chrono::steady_clock::now();
+                clearPlay(env);
+                for (const auto& p : g_bs.history)
+                    g_bs.play.push_back({env->NewGlobalRef(p.packet), p.connection, p.configuration});
+            } else closeChannel(env, ch);
+        }
         env->PopLocalFrame(nullptr); return;
     }
     if (ends(name, ".ServerboundStatusRequestPacket")) {
@@ -484,6 +504,12 @@ void JNICALL Native_BSide_channelRead(JNIEnv* env, jobject, jobject ctx, jobject
     } else if (ends(name, ".ServerboundConfigurationAcknowledgedPacket")) {
         if (!g_bs.session.configurationAcknowledged() || !swapProtocol(env, ch, g_bs.configIn, true))
             failB(env, "unexpected start-configuration acknowledgement");
+        else pump(env);
+    } else if (env->IsInstanceOf(packet, g_bs.serverPacksClass)) {
+        jobject packs = env->CallObjectMethod(packet, g_bs.knownPacks);
+        jint count = packs ? env->CallIntMethod(packs, g_bs.listSize) : -1;
+        if (g_bs.session.bInbound != Phase::Configuration || count < 0 ||
+            !g_bs.registries.selectB(static_cast<size_t>(count))) failB(env, "unexpected known-packs selection");
         else pump(env);
     } else if (ends(name, ".ServerboundFinishConfigurationPacket")) {
         if (!g_bs.session.finishAcknowledged() || !swapProtocol(env, ch, g_bs.bPendingPlayInbound, true))
@@ -595,6 +621,7 @@ bool cacheJavaRefs(JNIEnv* env, jobject loader) {
     jclass future = cls("io.netty.util.concurrent.Future");
     g_bs.futureDone = method(future, "isDone", "()Z");
     g_bs.futureSuccess = method(future, "isSuccess", "()Z");
+    g_bs.channelActive = method(channel, "isActive", "()Z");
     g_bs.channel = method(ctx, "channel", "()Lio/netty/channel/Channel;");
     g_bs.pipeline = method(channel, "pipeline", "()Lio/netty/channel/ChannelPipeline;");
     g_bs.write = method(channel, "writeAndFlush", "(Ljava/lang/Object;)Lio/netty/channel/ChannelFuture;");
@@ -641,6 +668,20 @@ bool cacheJavaRefs(JNIEnv* env, jobject loader) {
     g_bs.optionalClass = cls("java.util.Optional");
     g_bs.optionalOf = method(g_bs.optionalClass, "of", "(Ljava/lang/Object;)Ljava/util/Optional;", true);
     g_bs.optionalEmpty = method(g_bs.optionalClass, "empty", "()Ljava/util/Optional;", true);
+    g_bs.optionalPresent = method(g_bs.optionalClass, "isPresent", "()Z");
+    g_bs.listClass = cls("java.util.List");
+    g_bs.emptyList = method(g_bs.listClass, "of", "()Ljava/util/List;", true);
+    g_bs.listSize = method(g_bs.listClass, "size", "()I");
+    g_bs.listGet = method(g_bs.listClass, "get", "(I)Ljava/lang/Object;");
+    g_bs.clientPacksClass = cls("net.minecraft.network.protocol.configuration.ClientboundSelectKnownPacks");
+    g_bs.serverPacksClass = cls("net.minecraft.network.protocol.configuration.ServerboundSelectKnownPacks");
+    g_bs.clientPacksCtor = method(g_bs.clientPacksClass, "<init>", "(Ljava/util/List;)V");
+    g_bs.serverPacksCtor = method(g_bs.serverPacksClass, "<init>", "(Ljava/util/List;)V");
+    g_bs.knownPacks = method(g_bs.serverPacksClass, "knownPacks", "()Ljava/util/List;");
+    g_bs.registryClass = cls("net.minecraft.network.protocol.configuration.ClientboundRegistryDataPacket");
+    g_bs.registryEntries = method(g_bs.registryClass, "entries", "()Ljava/util/List;");
+    g_bs.entryClass = cls("net.minecraft.core.RegistrySynchronization$PackedRegistryEntry");
+    g_bs.entryData = method(g_bs.entryClass, "data", "()Ljava/util/Optional;");
     return ok;
 }
 
@@ -762,7 +803,8 @@ void observeA(JNIEnv* env, jobject packet) {
         drop(env, g_bs.finish);
         g_bs.finish = env->NewGlobalRef(packet);
         g_bs.session.aFinishedConfiguration = true;
-        g_bs.configurationComplete = true;
+        g_bs.configurationComplete = g_bs.registries.completePayloads;
+        if (!g_bs.configurationComplete) { failB(env, "registry snapshot contains omitted NBT"); return; }
         schedulePump(env);
         return;
     }
@@ -779,8 +821,37 @@ void observeA(JNIEnv* env, jobject packet) {
             g_bs.historyComplete = false;
             failB(env, "configuration journal overflow (no partial registry replay)"); return;
         }
-        g_bs.configuration.push_back({env->NewGlobalRef(packet), g_bs.session.connectionGeneration,
+        jobject replay = packet;
+        if (env->IsInstanceOf(packet, g_bs.clientPacksClass)) {
+            // B never depends on A's version-specific local data packs.
+            jobject empty = env->CallStaticObjectMethod(g_bs.listClass, g_bs.emptyList);
+            replay = empty ? env->NewObject(g_bs.clientPacksClass, g_bs.clientPacksCtor, empty) : nullptr;
+            if (empty) env->DeleteLocalRef(empty);
+            if (!replay || env->ExceptionCheck()) {
+                g_bs.historyComplete = false;
+                failB(env, "cannot create portable known-packs offer"); return;
+            }
+        } else if (env->IsInstanceOf(packet, g_bs.registryClass)) {
+            jobject entries = env->CallObjectMethod(packet, g_bs.registryEntries);
+            jint count = entries ? env->CallIntMethod(entries, g_bs.listSize) : -1;
+            bool valid = count >= 0;
+            for (jint i = 0; valid && i < count && !env->ExceptionCheck(); ++i) {
+                jobject entry = env->CallObjectMethod(entries, g_bs.listGet, i);
+                jobject data = entry ? env->CallObjectMethod(entry, g_bs.entryData) : nullptr;
+                valid = data && env->CallBooleanMethod(data, g_bs.optionalPresent);
+                if (data) env->DeleteLocalRef(data);
+                if (entry) env->DeleteLocalRef(entry);
+            }
+            if (entries) env->DeleteLocalRef(entries);
+            if (!g_bs.registries.registryEntry(valid && !env->ExceptionCheck())) {
+                g_bs.historyComplete = false;
+                LogTo("BServer: omitted registry NBT rejected; reconnect A after injection for full configuration");
+                failB(env, "backend did not supply portable registry data"); return;
+            }
+        }
+        g_bs.configuration.push_back({env->NewGlobalRef(replay), g_bs.session.connectionGeneration,
                                       g_bs.session.configurationGeneration});
+        if (replay != packet) env->DeleteLocalRef(replay);
         schedulePump(env);
         return;
     }
@@ -925,6 +996,35 @@ bool BServer_OnAWrite(JNIEnv* env, jobject ctx, jobject packet) {
     }
     // A also owns chat signatures, session updates and last-seen ACKs; do not drop signed writes.
     return !(g_bs.session.active() && BServer_ShouldRoutePlayerPacket(name.c_str()));
+}
+jobject BServer_PrepareAWrite(JNIEnv* env, jobject ctx, jobject packet) {
+    if (!g_bs.bound) return packet;
+    std::lock_guard<std::recursive_mutex> lock(g_bs.mu);
+    if (!isA(env, ctx) || !env->IsInstanceOf(packet, g_bs.serverPacksClass)) return packet;
+    jobject packs = env->CallObjectMethod(packet, g_bs.knownPacks);
+    jint count = packs ? env->CallIntMethod(packs, g_bs.listSize) : -1;
+    if (count == 0) {
+        if (packs) env->DeleteLocalRef(packs);
+        return packet;
+    }
+    jobject empty = nullptr, wire = nullptr;
+    if (count > 0 && sakura::RegistryReplay::replaceUpstreamSelection(static_cast<size_t>(count))) {
+        // Keep A's immutable packet and local resource negotiation intact; only the wire opts out.
+        empty = env->CallStaticObjectMethod(g_bs.listClass, g_bs.emptyList);
+        if (empty) wire = env->NewObject(g_bs.serverPacksClass, g_bs.serverPacksCtor, empty);
+    }
+    if (packs) env->DeleteLocalRef(packs);
+    if (empty) env->DeleteLocalRef(empty);
+    if (!wire || env->ExceptionCheck()) {
+        LogAndClearException(env, "BServer/upstream known packs");
+        g_bs.historyComplete = false;
+        g_bs.registries.registryEntry(false);
+        failB(env, "cannot request full upstream registries");
+        if (wire) env->DeleteLocalRef(wire);
+        return nullptr; // Fail closed: never forward a negotiated non-empty selection.
+    }
+    LogTo("BServer: upstream known-packs selection %d -> 0; full registry NBT requested", (int)count);
+    return wire;
 }
 void BServer_OnAInactive(JNIEnv* env, jobject ctx) {
     if (!g_bs.bound) return;

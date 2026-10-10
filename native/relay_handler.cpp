@@ -2,6 +2,7 @@
 
 #include "b_server.h"
 #include "classfile.h"
+#include "registry_replay.h"
 #include "random_name.h"
 
 
@@ -95,8 +96,16 @@ void JNICALL Native_RelayWrite(JNIEnv* env,
     LogTo("[C2S %s] %s", bypass ? "ROUTE" : (allow ? "PASS" : "DROP"), cls.c_str());
 
     if (allow) {
-        jobject future = env->CallObjectMethod(ctx, g_relay.netty.ctxWriteMid, msg, promise);
-        if (future) env->DeleteLocalRef(future);
+        jobject wire = bypass ? msg : BServer_PrepareAWrite(env, ctx, msg);
+        if (sakura::RegistryReplay::shouldForwardPreparedWrite(wire != nullptr)) {
+            jobject future = env->CallObjectMethod(ctx, g_relay.netty.ctxWriteMid, wire, promise);
+            if (future) env->DeleteLocalRef(future);
+        } else if (promise && g_relay.netty.promiseSetSuccessMid) {
+            // The original packet may contain stale negotiated packs; never fall back to it.
+            jobject completed = env->CallObjectMethod(promise, g_relay.netty.promiseSetSuccessMid);
+            if (completed) env->DeleteLocalRef(completed);
+        }
+        if (wire && wire != msg) env->DeleteLocalRef(wire);
     } else {
         if (promise && g_relay.netty.promiseSetSuccessMid) {
             jobject completed = env->CallObjectMethod(promise, g_relay.netty.promiseSetSuccessMid);

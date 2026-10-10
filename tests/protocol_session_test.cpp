@@ -73,11 +73,17 @@ int main() {
     CHECK(pending.bInbound == Phase::Closed && pending.bOutbound == Phase::Closed);
     b = s.bGeneration;
     configuration = s.configurationGeneration;
+    const auto aConnection = s.connectionGeneration;
+    const auto aConfiguration = s.configurationGeneration;
     s.detachB();
     CHECK(!s.active()); CHECK(!s.current(connection, configuration, b));
     CHECK(!s.finishAcknowledged());
+    CHECK(s.connectionGeneration == aConnection && s.configurationGeneration == aConfiguration);
+    CHECK(sakura::ProtocolSession::mayReplaceDisconnectedB(false));
+    CHECK(!sakura::ProtocolSession::mayReplaceDisconnectedB(true));
     s.attachB();
     CHECK(s.bInbound == Phase::Login && s.bOutbound == Phase::Login);
+    CHECK(s.connectionGeneration == aConnection && s.configurationGeneration == aConfiguration);
     s.disconnectA();
     CHECK(!s.active());
     CHECK(s.aPhase == Phase::Closed && s.bInbound == Phase::Closed && s.bOutbound == Phase::Closed);
