@@ -21,7 +21,7 @@ if ($listener) {
 
 Write-Host "DLL: $Dll"
 Write-Host "Injector: $Injector (reflective mapping)"
-Write-Host 'Waiting for a Java window containing Buji Island (50 ms scan interval)...' `
+Write-Host 'Waiting for a Java window containing KKCraft (50 ms scan interval)...' `
     -ForegroundColor Cyan
 
 & $Injector $Dll

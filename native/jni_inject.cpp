@@ -10,7 +10,7 @@ extern "C" {
 #include "../injector/LoadLibraryR.h"
 }
 
-static const wchar_t kBujiIsland[] = { 0x5e03, 0x5409, 0x5c9b, 0 };
+static const wchar_t kBujiIsland[] = L"KKCraft";
 
 static BOOL is_java_process(DWORD pid) {
     BOOL found = FALSE;

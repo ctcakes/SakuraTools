@@ -59,7 +59,7 @@ static ULONGLONG process_creation_time(DWORD pid) {
 }
 
 static BOOL title_is_buji_island(const wchar_t* title) {
-    static const wchar_t buji_island[] = {0x5e03, 0x5409, 0x5c9b, 0};
+    static const wchar_t buji_island[] = L"KKCraft";
     return wcsstr(title, buji_island) != NULL;
 }
 
@@ -94,7 +94,7 @@ static DWORD find_buji_island_process(void) {
 static DWORD wait_for_buji_island_process(void) {
     fprintf(stdout,
             "waiting for a visible Java window containing "
-            "U+5E03 U+5409 U+5C9B...\n");
+            "KKCraft...\n");
     fflush(stdout);
     for (;;) {
         DWORD pid = find_buji_island_process();
@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
     }
 
     pid = wait_for_buji_island_process();
-    fprintf(stdout, "matched Buji Island Java window, PID %lu\n", pid);
+    fprintf(stdout, "matched KKCraft Java window, PID %lu\n", pid);
 
     char msg[1024];
     BOOL ok = DoInject((DWORD)pid, dll, msg, (int)sizeof(msg));
